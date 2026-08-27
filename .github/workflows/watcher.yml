@@ -1,0 +1,59 @@
+name: event-watcher
+
+on:
+  schedule:
+    # MVP なので 6 時間ごと（UTC）。頻度を上げすぎない。
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Discord へ通知せず収集・保存のみ行う"
+        type: boolean
+        default: false
+
+# 同時実行を防ぐ（重複通知・DB 競合の回避）
+concurrency:
+  group: event-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ランナーは毎回破棄されるため、重複判定用の SQLite をキャッシュで引き継ぐ。
+      # キャッシュが失効すると再通知が起きうる点は README の「既知の制約」を参照。
+      - name: Restore event database
+        uses: actions/cache/restore@v4
+        with:
+          path: data/events.db
+          key: event-watcher-db-${{ github.run_id }}
+          restore-keys: |
+            event-watcher-db-
+
+      - name: Run watcher
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python -m src.main --log-level INFO \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: Save event database
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/events.db
+          key: event-watcher-db-${{ github.run_id }}

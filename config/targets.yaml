@@ -1,0 +1,36 @@
+# 監視設定
+#
+# feeds   : 収集する RSS/Atom フィード（ここを編集すれば収集元を変更できる）
+# targets : 監視対象と、その判定に使うキーワード
+# settings: 実行時の挙動
+#
+# ※ Discord Webhook URL はここに書かないこと（環境変数 DISCORD_WEBHOOK_URL を使う）
+
+feeds:
+  - name: PR TIMES
+    url: https://prtimes.jp/index.rdf
+  - name: ITmedia NEWS
+    url: https://rss.itmedia.co.jp/rss/2.0/news_bursts.xml
+  - name: 4Gamer
+    url: https://www.4gamer.net/rss/index.xml
+
+targets:
+  - name: Pokemon
+    keywords:
+      - ポケモン
+      - Pokemon
+      - ピカチュウ
+
+  - name: Convenience Stores
+    keywords:
+      - セブンイレブン
+      - ローソン
+      - ファミリーマート
+
+settings:
+  # 外部 HTTP 通信のタイムアウト（秒）
+  request_timeout_seconds: 10
+  # 1 回の実行で送る通知の上限（初回実行時の大量通知を防ぐ）
+  max_notifications_per_run: 20
+  # SQLite ファイルのパス（リポジトリルートからの相対パス）
+  db_path: data/events.db
