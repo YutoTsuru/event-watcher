@@ -9,6 +9,7 @@ RSS フィードを定期的に収集し、`config/targets.yaml` で指定した
 - 一致した記事は SQLite に保存し、URL / 内容ハッシュで重複を排除します（同じ記事を二度通知しません）。
 - 新規に保存できた記事だけを、公開日時の古い順に Discord Webhook へ通知します。
 - 通知は 10 件ずつ 1 メッセージにまとめて送り、レート制限（429）は `Retry-After` に従って待ってから再送します。
+- 通知の成否は `notifications` テーブルに記録され、**送れなかった記事は次回実行で自動的に再送されます**（上限 `settings.max_retry_count` 回）。
 - GitHub Actions 上で 6 時間ごとに自動実行できます。
 
 現在の `config/targets.yaml` は「ポケモンのコラボ情報」を追う設定になっています（[5. targets.yaml の設定方法](#5-targetsyaml-の設定方法) 参照）。
@@ -54,7 +55,7 @@ event-watcher/
 | --- | --- |
 | Collector（`src/collectors/`） | 取得のみ。RSS を取得して `Article` のリストを返す。判定・保存・通知は行わない。取得失敗時は例外を投げず空リストを返す。 |
 | Filter（`src/filters/`） | 判定のみ。`Article` が監視対象に一致するか判定し、一致した対象名のリストを返す。 |
-| Repository（`src/repositories/`） | 保存取得のみ。SQLite への `Event` の保存・重複確認・取得を行う。判定や通知のロジックは持たない。 |
+| Repository（`src/repositories/`） | 保存取得のみ。`EventRepository` が「何が起きたか」（`events`）、`NotificationRepository` が「通知できたか」（`notifications`）を担当する。判定や通知のロジックは持たない。 |
 | Notifier（`src/notifiers/`） | 通知のみ。`Event` を Discord Webhook に送信する（`notify_batch` で 10 件ずつまとめ送信）。保存や重複判定は行わない。 |
 | `src/main.py` | フロー。上記の各コンポーネントを組み立て、収集→判定→重複排除→保存→通知の流れを制御する。個々の失敗でループ全体を止めない。 |
 
@@ -62,11 +63,21 @@ event-watcher/
 
 ```
 収集（RSSCollector） → キーワード判定（KeywordFilter） → 重複排除（SQLiteEventRepository.exists）
-    → SQLite保存（SQLiteEventRepository.save） → まとめてDiscord通知（DiscordNotifier.notify_batch）
+    → SQLite保存（events） → 未通知として記録（notifications: pending）
+    → まとめてDiscord通知（DiscordNotifier.notify_batch） → 結果を記録（notifications: sent / failed）
 ```
 
 通知は記事 1 件ごとには送らず、全フィードの収集・保存が終わってから最後にまとめて送ります
 （1 件 1 リクエストだと過去分の一括通知でレート制限に掛かるため）。
+
+送信対象は「今回保存したもの」だけではありません。実行のたびに `notifications` テーブルから
+**未通知（pending）と、再送上限に達していない失敗（failed）** を拾い直して送ります。そのため
+
+- 通知に失敗した記事は、次回実行で自動的に再送される
+- `max_notifications_per_run` を超えて積み残した記事も、次回以降に順次送られる（取りこぼさない）
+
+という挙動になります。`events`（何が起きたか）と `notifications`（通知できたか）は
+テーブルも Repository も分かれており、`content_hash` で紐づいています。
 
 各段階の失敗は個別に catch してログに残し、他のフィード・記事の処理は継続します（`src/main.py` の `_collect_safely` / `_save_safely` など）。
 
@@ -116,8 +127,8 @@ pip install -r requirements.txt
 | キー | 必須 | デフォルト | 説明 |
 | --- | --- | --- | --- |
 | `request_timeout_seconds` | 任意 | `10` | RSS 取得・Discord 送信の HTTP タイムアウト（秒）。 |
-| `max_notifications_per_run` | 任意 | `20` | 1 回の実行で送る通知件数の上限。超過分は保存のみ行い通知しない（**保存済み＝通知済み扱いなので、後から自動で送り直されることはない**）。 |
-| `max_retry_count` | 任意 | `3` | 通知失敗イベントの再送上限（`notifications` テーブル用の設定。現状 `main.py` は未使用 → [11. 既知の制約](#11-既知の制約--注意点)）。 |
+| `max_notifications_per_run` | 任意 | `20` | 1 回の実行で送る通知件数の上限。超過分は未通知のまま残り、次回以降の実行で送られる。 |
+| `max_retry_count` | 任意 | `3` | 1 つの記事に対する**送信試行回数**の上限（初回 + 再送）。既定の `3` なら、初回失敗後に 2 回まで再送して諦める。 |
 | `db_path` | 任意 | `data/events.db` | SQLite ファイルのパス（リポジトリルートからの相対パス）。 |
 
 ### 監視対象を追加する例
@@ -224,9 +235,9 @@ python -m pytest -q
 ## 11. 既知の制約 / 注意点
 
 - **SQLite の永続化について**: GitHub Actions のランナーは実行のたびに破棄されるため、重複判定用の SQLite（`data/events.db`）は `actions/cache` を使って実行間で引き継いでいます。キャッシュが失効・削除された場合は重複判定の履歴が失われ、過去に通知済みの記事が再通知される可能性があります。恒久的な運用では、DB ファイルをリポジトリにコミットする方式や、外部データベース（例: マネージドな SQL/KVS サービス）への移行を検討してください。
-- **通知順序について**: 現在の実装は「保存してから通知する」順序になっているため、保存が成功した後に Discord への通知が失敗した記事は、保存済み（重複判定の対象）として扱われ、以降のスキップ対象となり再通知されません。
-- **リトライ機構が未接続**: `NotificationState` / `SQLiteNotificationRepository`（`notifications` テーブル、`settings.max_retry_count`）は実装・テスト済みですが、**`main.py` から呼ばれていません**。そのため上の「通知に失敗した記事は再送されない」制約が残ったままです。これを接続すれば、まとめ送信が失敗したチャンクを次回実行で自動的に送り直せます。
-- **まとめ送信の粒度**: 通知は 10 件で 1 リクエストのため、成否も 10 件単位でしか分かりません。1 リクエストが失敗すると、その 10 件すべてが「通知失敗」として数えられます。
+- **再送上限を超えた記事は諦める**: `max_retry_count` 回の送信試行がすべて失敗した記事は、それ以降は再送されません（無限に再送し続けないため）。該当があれば実行ログに警告が出ます。
+- **まとめ送信の粒度**: 通知は 10 件で 1 リクエストのため、成否も 10 件単位でしか分かりません。1 リクエストが失敗すると、その 10 件すべてが「通知失敗」として記録され、次回まとめて再送されます。
+- **既存 DB との互換性**: `notifications` テーブルは初回実行時に自動作成されます。この機構より前に保存済みだったイベントには通知状態の行が無いため、再送対象にはなりません（＝過去に通知済みのものが再送される心配はありません）。
 - **同じコラボの重複**: 重複排除は URL / タイトルのハッシュ単位です。同一のコラボを複数のメディアが報じた記事はそれぞれ別物として通知されます（初回の一括通知ではこれが目立ちます）。まとめるには記事単位ではなく「出来事」単位の同定が必要で、LLM フィルタ側の課題です。
 - **Google ニュース RSS への依存**: 現在の `feeds` は Google ニュースの検索 RSS に依存しています。1 クエリあたり最大 100 件で、仕様変更やクエリ構文の解釈に影響を受けます（`when:30d` の遡り幅も同様）。
 - **キーワード判定の精度について**: `KeywordFilter` は部分一致による判定であり、形態素解析は行っていません。日本語のキーワードは部分一致で概ね機能しますが、英単語（例: `Pokemon`）は無関係な文脈でも一致してしまう（誤検知する）可能性があります。
@@ -237,5 +248,5 @@ python -m pytest -q
 - LLM による関連性判定の追加: `src/filters/base.py` の `RelevanceFilter` を実装した `LLMRelevanceFilter`（仮）を追加し、`main.py` 側で `KeywordFilter` と差し替える。
 - RSS 以外の Collector の追加: `src/collectors/base.py` の `Collector` を実装し、API 収集やスクレイピングなど別の情報源に対応する。
 - Discord 以外の Notifier の追加: `src/notifiers/base.py` の `Notifier` を実装し、Slack やメールなど別の通知先に対応する。
-- 通知リトライの接続: `notifications` テーブルと `SQLiteNotificationRepository` は実装済みなので、`main.py` の保存・通知部分をこれ経由に書き換えれば、通知失敗時の再送が有効になる（現状の最有力の次の一手）。
+- 同一コラボの名寄せ: 現在は記事単位で重複排除しているため、同じコラボを複数メディアが報じた記事はそれぞれ通知される。「出来事」単位でまとめるには LLM による同定が必要。
 - 外部データベースへの移行: SQLite から外部 DB へ移行し、GitHub Actions のキャッシュ失効に依存しない永続化を実現する。
