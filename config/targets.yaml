@@ -6,31 +6,54 @@
 #
 # ※ Discord Webhook URL はここに書かないこと（環境変数 DISCORD_WEBHOOK_URL を使う）
 
+# 現在は「ポケモンのコラボ情報」に絞っている。
+#
+# Google ニュースの検索 RSS を使うと、
+#   (1) 検索クエリ自体が「ポケモン × コラボ」の絞り込みとして働く（記事本文まで検索される）
+#   (2) when:30d で過去 30 日分まで遡れるので、開催中のコラボも拾える
+# という 2 点が効く。通常の新着 RSS（PR TIMES など）は最新数十件しか持たないため、
+# 「今やっているコラボ」を洗い出す用途には向かない。
+#
+# クエリの注意点: 「A B OR C」のように AND と OR を混ぜると 0 件になる。
+# OR だけ・AND だけで 1 本のフィードにすること。
 feeds:
-  - name: PR TIMES
-    url: https://prtimes.jp/index.rdf
-  - name: ITmedia NEWS
-    url: https://rss.itmedia.co.jp/rss/2.0/news_bursts.xml
-  - name: 4Gamer
-    url: https://www.4gamer.net/rss/index.xml
+  - name: ポケモン コラボ
+    url: https://news.google.com/rss/search?q=%E3%83%9D%E3%82%B1%E3%83%A2%E3%83%B3+%E3%82%B3%E3%83%A9%E3%83%9C+when%3A30d&hl=ja&gl=JP&ceid=JP%3Aja
 
+  - name: ポケモン キャンペーン
+    url: https://news.google.com/rss/search?q=%E3%83%9D%E3%82%B1%E3%83%A2%E3%83%B3+%E3%82%AD%E3%83%A3%E3%83%B3%E3%83%9A%E3%83%BC%E3%83%B3+when%3A30d&hl=ja&gl=JP&ceid=JP%3Aja
+
+  - name: ポケモン 店舗・カフェ
+    url: https://news.google.com/rss/search?q=%E3%83%9D%E3%82%B1%E3%83%A2%E3%83%B3%E3%82%BB%E3%83%B3%E3%82%BF%E3%83%BC+OR+%E3%83%9D%E3%82%B1%E3%83%A2%E3%83%B3%E3%82%AB%E3%83%95%E3%82%A7+OR+%E3%83%9D%E3%82%B1%E3%83%A2%E3%83%B3%E3%82%B9%E3%83%88%E3%82%A2+when%3A30d&hl=ja&gl=JP&ceid=JP%3Aja
+
+  - name: ポケモン ポップアップ
+    url: https://news.google.com/rss/search?q=%E3%83%9D%E3%82%B1%E3%83%A2%E3%83%B3+%E3%83%9D%E3%83%83%E3%83%97%E3%82%A2%E3%83%83%E3%83%97%E3%82%B9%E3%83%88%E3%82%A2+when%3A30d&hl=ja&gl=JP&ceid=JP%3Aja
+
+# フィード側で「コラボ」の絞り込みは済んでいるので、ここは
+# 「本当にポケモンの話か」を確かめる安全網として働かせる。
+#
+# ここに「コラボ」等を必須キーワードとして足したくなるが、それはやらないこと。
+# Google ニュースの RSS はタイトルしか返さず、実際のコラボ記事でも
+# タイトルに「コラボ」が入らないもの（例:「サーモス『ポケモン』シリーズ登場」）が
+# 4 割ほどあり、それらを取りこぼすため。
 targets:
-  - name: Pokemon
+  - name: ポケモン
     keywords:
       - ポケモン
+      - ポケットモンスター
       - Pokemon
+      - Pokémon
       - ピカチュウ
-
-  - name: Convenience Stores
-    keywords:
-      - セブンイレブン
-      - ローソン
-      - ファミリーマート
+      - ポケカ
 
 settings:
   # 外部 HTTP 通信のタイムアウト（秒）
-  request_timeout_seconds: 10
-  # 1 回の実行で送る通知の上限（初回実行時の大量通知を防ぐ）
-  max_notifications_per_run: 20
+  request_timeout_seconds: 15
+  # 1 回の実行で送る通知の上限。
+  # まとめ送信するので 10 件ごとに 1 メッセージ。初回は過去 30 日分を一括で
+  # 流し込むため 300 件超になる。ここを下回ると残りは保存だけされて通知されない。
+  max_notifications_per_run: 500
+  # 通知失敗イベントを再送する最大回数
+  max_retry_count: 3
   # SQLite ファイルのパス（リポジトリルートからの相対パス）
   db_path: data/events.db

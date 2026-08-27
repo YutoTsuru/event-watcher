@@ -121,6 +121,10 @@ def run(
     """
     summary = RunSummary()
     detected_at = datetime.now(timezone.utc)
+    # 通知はここでは行わず、収集をすべて終えてからまとめて送る
+    # （1 件ずつ送るとレート制限に掛かりやすいため）
+    pending: list[Event] = []
+    limit_reported = False
 
     for collector in collectors:
         articles = _collect_safely(collector)
@@ -138,19 +142,55 @@ def run(
 
             if notifier is None:
                 continue
-            if summary.notified >= max_notifications:
-                logger.warning(
-                    "1 回あたりの通知上限 (%d) に達したため、以降は保存のみ行います",
-                    max_notifications,
-                )
+            if len(pending) >= max_notifications:
+                if not limit_reported:
+                    logger.warning(
+                        "1 回あたりの通知上限 (%d) に達したため、以降は保存のみ行います",
+                        max_notifications,
+                    )
+                    limit_reported = True
                 continue
+            pending.append(event)
 
-            if notifier.notify(event):
-                summary.notified += 1
-            else:
-                summary.notify_failed += 1
+    if notifier is not None and pending:
+        _notify_safely(notifier, _oldest_first(pending), summary)
 
     return summary
+
+
+def _oldest_first(events: list[Event]) -> list[Event]:
+    """公開日時の古い順に並べ替える。
+
+    チャットは新しい投稿が下に積まれるため、古い順に送ると時系列どおりに読める。
+    公開日時が取れなかったものは末尾に回す。Collector によっては tz なしの
+    日時が来るかもしれないので、その場合は UTC とみなして比較する。
+    """
+
+    def sort_key(event: Event) -> tuple[int, datetime]:
+        published = event.published_at
+        if published is None:
+            return (1, datetime.min.replace(tzinfo=timezone.utc))
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+        return (0, published)
+
+    return sorted(events, key=sort_key)
+
+
+def _notify_safely(notifier: Notifier, events: list[Event], summary: RunSummary) -> None:
+    """まとめて通知し、成否を集計する。通知の失敗でアプリを止めない。"""
+    logger.info("通知を送信します: %d 件", len(events))
+    try:
+        results = list(notifier.notify_batch(events))
+    except Exception:
+        logger.exception("通知処理が予期せず失敗しました count=%d", len(events))
+        summary.notify_failed += len(events)
+        return
+
+    succeeded = sum(1 for result in results if result)
+    # notify_batch が events と同じ件数を返さなかった分は失敗として扱う
+    summary.notified += succeeded
+    summary.notify_failed += len(events) - succeeded
 
 
 def _collect_safely(collector: Collector) -> list[Article]:

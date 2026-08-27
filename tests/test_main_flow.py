@@ -239,3 +239,122 @@ def test_run_respects_max_notifications_per_run(
     assert summary.notified == 1
     assert summary.notify_failed == 0
     assert repo.count() == 3
+
+
+class FakeBatchNotifier(Notifier):
+    """notify_batch をオーバーライドし、まとめ送信の呼ばれ方を記録するフェイク。"""
+
+    def __init__(self, succeed: bool = True) -> None:
+        self._succeed = succeed
+        self.batches: list[list[Event]] = []
+
+    def notify(self, event: Event) -> bool:  # pragma: no cover - 呼ばれない想定
+        raise AssertionError("notify_batch がある場合、1 件ずつの notify は使わない")
+
+    def notify_batch(self, events) -> list[bool]:
+        self.batches.append(list(events))
+        return [self._succeed] * len(events)
+
+
+def test_run_dispatches_all_events_in_a_single_batch(
+    repo: SQLiteEventRepository, keyword_filter: KeywordFilter
+) -> None:
+    """複数フィードにまたがる一致記事も、収集後にまとめて 1 回で通知される。"""
+    collectors = [
+        FakeCollector(
+            f"フィード{i}",
+            articles=[make_pokemon_article(url=f"https://example.com/pokemon-{i}")],
+        )
+        for i in range(3)
+    ]
+    notifier = FakeBatchNotifier(succeed=True)
+
+    summary = run(
+        collectors=collectors,
+        relevance_filter=keyword_filter,
+        repository=repo,
+        notifier=notifier,
+        max_notifications=200,
+    )
+
+    assert summary.saved == 3
+    assert summary.notified == 3
+    assert len(notifier.batches) == 1  # フィードごとではなく、最後に 1 回
+    assert len(notifier.batches[0]) == 3
+
+
+def test_run_does_not_notify_when_nothing_was_saved(
+    repo: SQLiteEventRepository, keyword_filter: KeywordFilter
+) -> None:
+    """保存対象が 0 件なら、通知処理自体を呼ばない（空メッセージを送らない）。"""
+    collector = FakeCollector("フィード1", articles=[make_unrelated_article()])
+    notifier = FakeBatchNotifier(succeed=True)
+
+    summary = run(
+        collectors=[collector],
+        relevance_filter=keyword_filter,
+        repository=repo,
+        notifier=notifier,
+        max_notifications=200,
+    )
+
+    assert summary.saved == 0
+    assert notifier.batches == []
+
+
+def test_run_counts_batch_failure_as_notify_failed(
+    repo: SQLiteEventRepository, keyword_filter: KeywordFilter
+) -> None:
+    """まとめ送信が失敗しても保存は残り、失敗件数として集計される。"""
+    articles = [make_pokemon_article(url=f"https://example.com/pokemon-{i}") for i in range(4)]
+    notifier = FakeBatchNotifier(succeed=False)
+
+    summary = run(
+        collectors=[FakeCollector("フィード1", articles=articles)],
+        relevance_filter=keyword_filter,
+        repository=repo,
+        notifier=notifier,
+        max_notifications=200,
+    )
+
+    assert summary.saved == 4
+    assert summary.notified == 0
+    assert summary.notify_failed == 4
+
+
+def test_run_notifies_in_oldest_first_order(
+    repo: SQLiteEventRepository, keyword_filter: KeywordFilter
+) -> None:
+    """通知は公開日時の古い順に並ぶ（日時不明のものは末尾）。"""
+    def article(url: str, published: Optional[datetime]) -> Article:
+        return Article(
+            title="ポケモンコラボ開催",
+            url=url,
+            source="フィード1",
+            published_at=published,
+            summary="コラボの告知です。",
+        )
+
+    articles = [
+        article("https://example.com/c", datetime(2026, 3, 3, tzinfo=timezone.utc)),
+        article("https://example.com/none", None),
+        article("https://example.com/a", datetime(2026, 1, 1, tzinfo=timezone.utc)),
+        article("https://example.com/b", datetime(2026, 2, 2, tzinfo=timezone.utc)),
+    ]
+    notifier = FakeBatchNotifier(succeed=True)
+
+    run(
+        collectors=[FakeCollector("フィード1", articles=articles)],
+        relevance_filter=keyword_filter,
+        repository=repo,
+        notifier=notifier,
+        max_notifications=200,
+    )
+
+    urls = [event.url for event in notifier.batches[0]]
+    assert urls == [
+        "https://example.com/a",
+        "https://example.com/b",
+        "https://example.com/c",
+        "https://example.com/none",
+    ]
