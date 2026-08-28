@@ -60,8 +60,11 @@ class FakeNotifier(Notifier):
 
 
 def make_pokemon_article(url: str = "https://example.com/pokemon-1") -> Article:
+    # タイトルでも名寄せされるため、URL が違えば別記事になるようタイトルも変える。
+    # ハイフンは「タイトル - 媒体名」の区切りとみなされるので取り除く
+    slug = url.rsplit("/", 1)[-1].replace("-", "")
     return Article(
-        title="新作ポケモンゲームが発表",
+        title=f"新作ポケモンゲームが発表されました（{slug}）",
         url=url,
         source="フィード1",
         published_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -366,7 +369,7 @@ def test_run_notifies_in_oldest_first_order(
     """通知は公開日時の古い順に並ぶ（日時不明のものは末尾）。"""
     def article(url: str, published: Optional[datetime]) -> Article:
         return Article(
-            title="ポケモンコラボ開催",
+            title=f"ポケモンコラボ開催のお知らせ（{url.rsplit('/', 1)[-1].replace('-', '')}）",
             url=url,
             source="フィード1",
             published_at=published,

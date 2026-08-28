@@ -7,10 +7,16 @@ Collector / Filter / Repository / Notifier の各層は、このモジュール�
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
+
+# タイトル末尾に付く配信元の表記（「 - 朝日新聞」「｜ファミ通」など）
+_SOURCE_SUFFIX_PATTERN = re.compile(r"\s*[-–—|｜]\s*[^-–—|｜]{2,25}\s*$")
+# これより短いタイトルは、たまたま一致しただけの可能性があるので名寄せに使わない
+MIN_TITLE_KEY_LENGTH = 10
 
 
 @dataclass(frozen=True)
@@ -42,6 +48,8 @@ class Event:
     matched_targets: list[str] = field(default_factory=list)
     # 記事の要約。通知本文に出すため保存する（フィードによっては空）
     summary: str = ""
+    # 別ソースで同じ記事を拾ったときの名寄せキー（短いタイトルでは空）
+    title_key: str = ""
 
     @classmethod
     def from_article(
@@ -59,6 +67,7 @@ class Event:
             content_hash=make_content_hash(article.title, article.url),
             matched_targets=list(matched_targets),
             summary=article.summary,
+            title_key=make_title_key(article.title),
         )
 
 
@@ -96,6 +105,24 @@ class NotificationState:
         if self.status is NotificationStatus.PENDING:
             return True
         return self.retry_count < max_retry_count
+
+
+def make_title_key(title: str) -> str:
+    """同じ記事を別ソース・別 URL で拾ったときに名寄せするためのキー。
+
+    同じ記事でも、経路によってタイトルの末尾に配信元が付く
+    （Google ニュース経由は「タイトル - 媒体名」、直接ソースは「タイトル」）。
+    そこで末尾の配信元表記を落とし、記号と空白を無視した形に正規化する。
+
+    短いタイトルは別記事どうしがたまたま一致しうるので、
+    正規化後が短い場合は空文字を返して名寄せの対象外にする
+    （空文字のキーは重複判定に使わない）。
+    """
+    without_source = _SOURCE_SUFFIX_PATTERN.sub("", title.strip())
+    normalized = re.sub(r"\W+", "", without_source, flags=re.UNICODE).lower()
+    if len(normalized) < MIN_TITLE_KEY_LENGTH:
+        return ""
+    return normalized
 
 
 def make_content_hash(title: str, url: str) -> str:

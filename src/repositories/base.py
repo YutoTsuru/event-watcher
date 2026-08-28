@@ -24,8 +24,12 @@ class EventRepository(ABC):
         """テーブルなどの初期化。"""
 
     @abstractmethod
-    def exists(self, url: str, content_hash: str) -> bool:
-        """URL または content_hash が既に保存済みかどうか。"""
+    def exists(self, url: str, content_hash: str, title_key: str = "") -> bool:
+        """URL / content_hash / title_key のいずれかが既に保存済みかどうか。
+
+        title_key は別ソースで同じ記事を拾ったときの名寄せ用。
+        空文字は「名寄せに使わない」という意味で、判定条件から外す。
+        """
 
     @abstractmethod
     def save(self, event: Event) -> bool:

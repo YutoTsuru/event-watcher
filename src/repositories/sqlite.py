@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
-from src.models import Event, NotificationState, NotificationStatus
+from src.models import Event, NotificationState, NotificationStatus, make_title_key
 from src.repositories.base import EventRepository, NotificationRepository
 
 logger = logging.getLogger(__name__)
@@ -34,10 +34,16 @@ CREATE TABLE IF NOT EXISTS events (
     detected_at     TEXT NOT NULL,
     content_hash    TEXT NOT NULL UNIQUE,
     matched_targets TEXT NOT NULL,
-    summary         TEXT NOT NULL DEFAULT ''
+    summary         TEXT NOT NULL DEFAULT '',
+    title_key       TEXT NOT NULL DEFAULT ''
 );
+"""
+
+# インデックスは列が揃ってから作る（古い DB では ALTER TABLE の後になる）
+INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_events_content_hash ON events (content_hash);
 CREATE INDEX IF NOT EXISTS idx_events_detected_at ON events (detected_at);
+CREATE INDEX IF NOT EXISTS idx_events_title_key ON events (title_key);
 """
 
 NOTIFICATION_SCHEMA = """
@@ -81,14 +87,25 @@ class SQLiteEventRepository(_SQLiteRepositoryBase, EventRepository):
         with self._connect() as conn:
             conn.executescript(SCHEMA)
             _add_missing_columns(conn)
+            conn.executescript(INDEXES)
         logger.info("SQLite を初期化しました: %s", self._db_path)
 
-    def exists(self, url: str, content_hash: str) -> bool:
-        """URL または content_hash が既に保存済みかどうか。"""
+    def exists(self, url: str, content_hash: str, title_key: str = "") -> bool:
+        """URL / content_hash / title_key のいずれかが既に保存済みかどうか。
+
+        title_key は別ソースで同じ記事を拾ったときの名寄せ用。空文字は
+        「名寄せに使わない」という意味なので、判定条件から外す。
+        """
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT 1 FROM events WHERE url = ? OR content_hash = ? LIMIT 1",
-                (url, content_hash),
+                """
+                SELECT 1 FROM events
+                 WHERE url = ?
+                    OR content_hash = ?
+                    OR (? <> '' AND title_key = ?)
+                 LIMIT 1
+                """,
+                (url, content_hash, title_key, title_key),
             ).fetchone()
         return row is not None
 
@@ -99,8 +116,8 @@ class SQLiteEventRepository(_SQLiteRepositoryBase, EventRepository):
                 """
                 INSERT OR IGNORE INTO events
                     (title, url, source, published_at, detected_at, content_hash,
-                     matched_targets, summary)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     matched_targets, summary, title_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.title,
@@ -111,6 +128,7 @@ class SQLiteEventRepository(_SQLiteRepositoryBase, EventRepository):
                     event.content_hash,
                     json.dumps(event.matched_targets, ensure_ascii=False),
                     event.summary,
+                    event.title_key,
                 ),
             )
             inserted = cursor.rowcount > 0
@@ -241,6 +259,24 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
     if "summary" not in existing:
         conn.execute("ALTER TABLE events ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
         logger.info("events テーブルに summary 列を追加しました")
+    if "title_key" not in existing:
+        conn.execute("ALTER TABLE events ADD COLUMN title_key TEXT NOT NULL DEFAULT ''")
+        filled = _backfill_title_keys(conn)
+        logger.info(
+            "events テーブルに title_key 列を追加し、既存 %d 件に名寄せキーを設定しました", filled
+        )
+
+
+def _backfill_title_keys(conn: sqlite3.Connection) -> int:
+    """既存行の title_key を埋める。
+
+    埋めておかないと、過去に保存した記事と新しく拾った同じ記事を
+    名寄せできず、重複通知が 1 回だけ発生してしまう。
+    """
+    rows = conn.execute("SELECT id, title FROM events").fetchall()
+    updates = [(make_title_key(row["title"]), row["id"]) for row in rows]
+    conn.executemany("UPDATE events SET title_key = ? WHERE id = ?", updates)
+    return len(updates)
 
 
 def _now_iso() -> str:
@@ -295,4 +331,5 @@ def _to_event(row: sqlite3.Row) -> Event:
         content_hash=row["content_hash"],
         matched_targets=matched_targets,
         summary=row["summary"] or "",
+        title_key=row["title_key"] or "",
     )

@@ -345,7 +345,7 @@ def _to_event_if_matched(
 def _save_safely(repository: EventRepository, event: Event) -> bool:
     """新規保存できたら True。既知 / 保存失敗なら False（通知対象にしない）。"""
     try:
-        if repository.exists(event.url, event.content_hash):
+        if repository.exists(event.url, event.content_hash, event.title_key):
             logger.debug("保存済みのためスキップします: %s", event.url)
             return False
         return repository.save(event)

@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.models import Event, make_content_hash
+from src.models import Event, make_content_hash, make_title_key
 from src.repositories.sqlite import SQLiteEventRepository
 
 
@@ -264,3 +264,77 @@ def test_initialize_adds_summary_column_to_an_existing_table(tmp_path: Path) -> 
     saved = repository.find_by_hash(event.content_hash)
     assert saved is not None
     assert saved.summary == "新しい要約"
+
+
+def test_exists_matches_on_title_key(repository: SQLiteEventRepository) -> None:
+    """URL も content_hash も違うが、同じ記事（同じ title_key）なら重複とみなす。"""
+    saved = make_event(
+        title="ポケモンとクロックスのコラボが決定しました - 電撃オンライン",
+        url="https://news.google.com/rss/articles/ABC",
+    )
+    saved.title_key = make_title_key(saved.title)
+    repository.save(saved)
+
+    # 直接ソース経由で拾った、同じ記事（媒体名が付かないタイトル・別 URL）
+    same_article_key = make_title_key("ポケモンとクロックスのコラボが決定しました")
+
+    assert repository.exists(
+        "https://dengekionline.com/articles/1", "違うハッシュ", same_article_key
+    ) is True
+
+
+def test_exists_ignores_empty_title_key(repository: SQLiteEventRepository) -> None:
+    """空の title_key は名寄せに使わない（空どうしが一致してはいけない）。"""
+    saved = make_event(url="https://example.com/a")
+    saved.title_key = ""
+    repository.save(saved)
+
+    assert repository.exists("https://example.com/b", "違うハッシュ", "") is False
+
+
+def test_initialize_backfills_title_key_for_existing_rows(tmp_path: Path) -> None:
+    """title_key 列を追加したとき、既存行にも名寄せキーを埋める。
+
+    埋めないと、過去に保存済みの記事を別ソースで拾い直したときに
+    重複通知が 1 回発生してしまう。
+    """
+    import sqlite3
+
+    db_path = tmp_path / "legacy_title_key.db"
+    title = "ポケモンとクロックスのコラボが決定しました - 電撃オンライン"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                title           TEXT NOT NULL,
+                url             TEXT NOT NULL UNIQUE,
+                source          TEXT NOT NULL,
+                published_at    TEXT,
+                detected_at     TEXT NOT NULL,
+                content_hash    TEXT NOT NULL UNIQUE,
+                matched_targets TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO events"
+            " (title, url, source, published_at, detected_at, content_hash, matched_targets)"
+            " VALUES (?, 'https://news.google.com/x', 'テスト', NULL,"
+            " '2026-01-01T00:00:00+00:00', 'oldhash', '[]')",
+            (title,),
+        )
+
+    repository = SQLiteEventRepository(db_path)
+    repository.initialize()
+
+    restored = repository.find_by_hash("oldhash")
+    assert restored is not None
+    assert restored.title_key == make_title_key(title)
+
+    # 同じ記事を別ソースで拾っても、既存行と名寄せされて重複と判定される
+    assert repository.exists(
+        "https://dengekionline.com/articles/1",
+        "別ハッシュ",
+        make_title_key("ポケモンとクロックスのコラボが決定しました"),
+    ) is True
