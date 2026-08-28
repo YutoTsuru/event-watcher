@@ -27,6 +27,8 @@ EMBED_COLOR = 0x5865F2
 
 # Discord の仕様上、1 メッセージあたりの embed 数の上限
 MAX_EMBEDS_PER_MESSAGE = 10
+# 通知本文（要約）の最大文字数。10 件並べても一覧できる長さに抑える
+MAX_DESCRIPTION_LENGTH = 180
 # 429 を受けたときに待って再送する最大回数
 MAX_RATE_LIMIT_RETRIES = 3
 # Retry-After が読めなかった場合の待ち時間（秒）
@@ -126,24 +128,35 @@ def _retry_after_seconds(response: requests.Response) -> float:
 
 
 def build_embed(event: Event) -> dict[str, Any]:
-    """Event を Discord の embed 1 個に変換する。"""
-    fields: list[dict[str, Any]] = [
-        {"name": "ソース", "value": event.source or "unknown", "inline": True},
-    ]
-    if event.matched_targets:
-        fields.append(
-            {"name": "一致した対象", "value": ", ".join(event.matched_targets), "inline": True}
-        )
-    published = _format_datetime(event.published_at)
-    if published:
-        fields.append({"name": "公開日時", "value": published, "inline": False})
+    """Event を Discord の embed 1 個に変換する。
 
-    return {
+    URL を開かなくても中身を判断できるよう、要約を本文に載せる。
+    ソースや一致した対象は毎回見る必要が無いので載せない。
+    """
+    embed: dict[str, Any] = {
         "title": event.title[:250],
         "url": event.url,
         "color": EMBED_COLOR,
-        "fields": fields,
     }
+
+    summary = _shorten(event.summary, MAX_DESCRIPTION_LENGTH)
+    if summary:
+        embed["description"] = summary
+
+    published = _format_datetime(event.published_at)
+    if published:
+        # 1 行の補足なので fields ではなく footer に置く（縦に伸びない）
+        embed["footer"] = {"text": published}
+
+    return embed
+
+
+def _shorten(text: str, limit: int) -> str:
+    """通知に載せる長さに切り詰める。切った場合は末尾を … にする。"""
+    trimmed = (text or "").strip()
+    if len(trimmed) <= limit:
+        return trimmed
+    return trimmed[: limit - 1].rstrip() + "…"
 
 
 def build_payload(event: Event) -> dict[str, Any]:

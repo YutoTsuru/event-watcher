@@ -40,6 +40,8 @@ class Event:
     detected_at: datetime
     content_hash: str
     matched_targets: list[str] = field(default_factory=list)
+    # 記事の要約。通知本文に出すため保存する（フィードによっては空）
+    summary: str = ""
 
     @classmethod
     def from_article(
@@ -56,6 +58,7 @@ class Event:
             detected_at=detected_at or datetime.now(timezone.utc),
             content_hash=make_content_hash(article.title, article.url),
             matched_targets=list(matched_targets),
+            summary=article.summary,
         )
 
 

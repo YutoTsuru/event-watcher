@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS events (
     published_at    TEXT,
     detected_at     TEXT NOT NULL,
     content_hash    TEXT NOT NULL UNIQUE,
-    matched_targets TEXT NOT NULL
+    matched_targets TEXT NOT NULL,
+    summary         TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_events_content_hash ON events (content_hash);
 CREATE INDEX IF NOT EXISTS idx_events_detected_at ON events (detected_at);
@@ -79,6 +80,7 @@ class SQLiteEventRepository(_SQLiteRepositoryBase, EventRepository):
         """テーブル・インデックスを作成する（既に存在すれば何もしない）。"""
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            _add_missing_columns(conn)
         logger.info("SQLite を初期化しました: %s", self._db_path)
 
     def exists(self, url: str, content_hash: str) -> bool:
@@ -96,8 +98,9 @@ class SQLiteEventRepository(_SQLiteRepositoryBase, EventRepository):
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO events
-                    (title, url, source, published_at, detected_at, content_hash, matched_targets)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (title, url, source, published_at, detected_at, content_hash,
+                     matched_targets, summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.title,
@@ -107,6 +110,7 @@ class SQLiteEventRepository(_SQLiteRepositoryBase, EventRepository):
                     _to_iso(event.detected_at),
                     event.content_hash,
                     json.dumps(event.matched_targets, ensure_ascii=False),
+                    event.summary,
                 ),
             )
             inserted = cursor.rowcount > 0
@@ -226,6 +230,19 @@ class SQLiteNotificationRepository(_SQLiteRepositoryBase, NotificationRepository
         return int(row["c"])
 
 
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """既存の events テーブルに、後から増えた列を追加する。
+
+    CREATE TABLE IF NOT EXISTS は既存テーブルには効かないため、
+    以前のバージョンで作られた DB（GitHub Actions のキャッシュなど）を
+    そのまま使えるように、足りない列だけ ALTER TABLE で足す。
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
+    if "summary" not in existing:
+        conn.execute("ALTER TABLE events ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+        logger.info("events テーブルに summary 列を追加しました")
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -277,4 +294,5 @@ def _to_event(row: sqlite3.Row) -> Event:
         detected_at=_from_iso(row["detected_at"]),
         content_hash=row["content_hash"],
         matched_targets=matched_targets,
+        summary=row["summary"] or "",
     )

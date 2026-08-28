@@ -24,6 +24,7 @@ from src.collectors.base import Collector
 from src.collectors.rss import RSSCollector
 from src.config import AppConfig, ConfigError, load_config
 from src.filters.base import RelevanceFilter
+from src.filters.feed_requirement import FeedRequirementFilter
 from src.filters.keyword import KeywordFilter
 from src.logging_config import setup_logging
 from src.models import Article, Event, NotificationState
@@ -94,7 +95,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return EXIT_FATAL
 
     collectors = build_collectors(config)
-    relevance_filter = KeywordFilter(config.targets)
+    relevance_filter = build_filter(config)
 
     summary = run(
         collectors=collectors,
@@ -119,6 +120,21 @@ def build_collectors(config: AppConfig) -> list[Collector]:
         )
         for feed in config.feeds
     ]
+
+
+def build_filter(config: AppConfig) -> RelevanceFilter:
+    """設定から判定フィルタを組み立てる。
+
+    キーワード判定（OR）を、フィードごとの必須キーワード（AND）で包む。
+    require_any を持つフィードが 1 つも無ければ、包む意味が無いので素通しにする。
+    """
+    keyword_filter = KeywordFilter(config.targets)
+    requirements = {
+        feed.name: feed.require_any for feed in config.feeds if feed.require_any
+    }
+    if not requirements:
+        return keyword_filter
+    return FeedRequirementFilter(keyword_filter, requirements)
 
 
 def run(

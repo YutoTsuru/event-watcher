@@ -203,3 +203,64 @@ def test_repository_creates_db_file_under_tmp_path(tmp_path: Path) -> None:
     repo.initialize()
 
     assert db_path.exists()
+
+
+def test_summary_round_trips(repository: SQLiteEventRepository) -> None:
+    """要約は保存され、読み戻せる（通知は DB から読み直して送るため必須）。"""
+    event = make_event()
+    event.summary = "9月1日よりコラボグッズの販売を開始します。"
+
+    repository.save(event)
+    restored = repository.find_by_hash(event.content_hash)
+
+    assert restored is not None
+    assert restored.summary == event.summary
+
+
+def test_initialize_adds_summary_column_to_an_existing_table(tmp_path: Path) -> None:
+    """summary 列が無い旧バージョンの DB でも、初期化時に列が足されて読み書きできる。
+
+    GitHub Actions のキャッシュで引き継がれた DB がまさにこの状態になる。
+    """
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    # summary 列を持たない、以前のスキーマの events テーブルを作る
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                title           TEXT NOT NULL,
+                url             TEXT NOT NULL UNIQUE,
+                source          TEXT NOT NULL,
+                published_at    TEXT,
+                detected_at     TEXT NOT NULL,
+                content_hash    TEXT NOT NULL UNIQUE,
+                matched_targets TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO events"
+            " (title, url, source, published_at, detected_at, content_hash, matched_targets)"
+            " VALUES ('旧データ', 'https://example.com/old', 'テスト', NULL,"
+            " '2026-01-01T00:00:00+00:00', 'oldhash', '[]')"
+        )
+
+    repository = SQLiteEventRepository(db_path)
+    repository.initialize()
+
+    # 既存行は残り、要約は空として読める
+    legacy = repository.find_by_hash("oldhash")
+    assert legacy is not None
+    assert legacy.summary == ""
+
+    # 新しい行は要約付きで保存できる
+    event = make_event()
+    event.summary = "新しい要約"
+    assert repository.save(event) is True
+    assert repository.count() == 2
+    saved = repository.find_by_hash(event.content_hash)
+    assert saved is not None
+    assert saved.summary == "新しい要約"

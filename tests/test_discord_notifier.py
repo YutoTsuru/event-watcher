@@ -15,9 +15,11 @@ import requests
 
 from src.models import Event, make_content_hash
 from src.notifiers.discord import (
+    MAX_DESCRIPTION_LENGTH,
     WEBHOOK_ENV_VAR,
     DiscordNotifier,
     DiscordNotifierError,
+    build_embed,
     build_payload,
 )
 
@@ -37,8 +39,8 @@ def make_event(**overrides: Any) -> Event:
 
 
 def test_build_payload_shape() -> None:
-    """Discord Webhook に送るペイロードの形（embeds/title/url/fields）を検証する。"""
-    event = make_event()
+    """Discord Webhook に送るペイロードの形（embeds/title/url/description/footer）を検証する。"""
+    event = make_event(summary="ピカチュウデザインのカメラが10月6日に発売されます。")
 
     payload = build_payload(event)
 
@@ -48,18 +50,43 @@ def test_build_payload_shape() -> None:
     assert embed["title"] == event.title
     assert embed["url"] == event.url
     assert embed["color"] == 0x5865F2
-    field_names = [f["name"] for f in embed["fields"]]
-    assert "ソース" in field_names
-    assert "一致した対象" in field_names
+    assert embed["description"] == event.summary
+    assert embed["footer"]["text"].startswith("2026-01-01")
 
 
-def test_build_payload_without_matched_targets_omits_field() -> None:
-    event = make_event(matched_targets=[])
+def test_build_embed_omits_source_and_matched_targets() -> None:
+    """ソース・一致した対象は毎回見る必要が無いので載せない。"""
+    event = make_event(source="テストフィード", matched_targets=["ポケモン"])
 
-    payload = build_payload(event)
+    embed = build_embed(event)
 
-    field_names = [f["name"] for f in payload["embeds"][0]["fields"]]
-    assert "一致した対象" not in field_names
+    rendered = str(embed)
+    assert "ソース" not in rendered
+    assert "一致した対象" not in rendered
+    assert "fields" not in embed
+
+
+def test_build_embed_omits_description_when_summary_is_empty() -> None:
+    """要約を持たないフィード（Google ニュースなど）では description を付けない。"""
+    embed = build_embed(make_event(summary=""))
+
+    assert "description" not in embed
+
+
+def test_build_embed_shortens_long_summary() -> None:
+    """長い要約は通知に載る長さに切り詰め、末尾を … にする。"""
+    event = make_event(summary="あ" * 500)
+
+    embed = build_embed(event)
+
+    assert len(embed["description"]) == MAX_DESCRIPTION_LENGTH
+    assert embed["description"].endswith("…")
+
+
+def test_build_embed_without_published_at_omits_footer() -> None:
+    embed = build_embed(make_event(published_at=None))
+
+    assert "footer" not in embed
 
 
 def test_notifier_requires_non_empty_webhook_url() -> None:

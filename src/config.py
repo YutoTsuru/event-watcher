@@ -39,6 +39,9 @@ class FeedConfig:
 
     name: str
     url: str
+    # このフィードから拾う記事に必須のキーワード（1 つでも含めば通す）。
+    # 一般ニュースのフィードから「コラボ関連だけ」を拾うために使う。空なら絞り込まない。
+    require_any: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -95,7 +98,18 @@ def _parse_feeds(raw_feeds: Any) -> list[FeedConfig]:
         url = item.get("url")
         if not url:
             raise ConfigError(f"feeds[{index}] に 'url' がありません")
-        feeds.append(FeedConfig(name=str(item.get("name") or url), url=str(url)))
+
+        raw_require = item.get("require_any") or []
+        if not isinstance(raw_require, list):
+            raise ConfigError(f"feeds[{index}] の 'require_any' はリストである必要があります")
+
+        feeds.append(
+            FeedConfig(
+                name=str(item.get("name") or url),
+                url=str(url),
+                require_any=[str(keyword) for keyword in raw_require],
+            )
+        )
     return feeds
 
 
