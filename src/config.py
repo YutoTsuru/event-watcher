@@ -21,6 +21,8 @@ DEFAULT_MAX_RETRY_COUNT = 3
 # 公開からこの日数を過ぎた記事は保存のみで通知しない（0 以下なら無制限）
 DEFAULT_MAX_ARTICLE_AGE_DAYS = 3
 DEFAULT_DB_PATH = "data/events.db"
+# 通知先 Discord Webhook URL を読む環境変数（話題ごとにチャンネルを分けるときに変える）
+DEFAULT_WEBHOOK_ENV = "DISCORD_WEBHOOK_URL"
 
 
 class ConfigError(Exception):
@@ -58,6 +60,8 @@ class Settings:
     # 0 以下なら日数で絞らない。
     max_article_age_days: float = DEFAULT_MAX_ARTICLE_AGE_DAYS
     db_path: str = DEFAULT_DB_PATH
+    # 通知先 Discord Webhook URL を読む環境変数名。URL そのものは設定ファイルに書かない
+    webhook_env: str = DEFAULT_WEBHOOK_ENV
 
 
 @dataclass(frozen=True)
@@ -182,6 +186,7 @@ def _parse_settings(raw_settings: Any) -> Settings:
                 raw_settings.get("max_article_age_days", DEFAULT_MAX_ARTICLE_AGE_DAYS)
             ),
             db_path=str(raw_settings.get("db_path", DEFAULT_DB_PATH)),
+            webhook_env=str(raw_settings.get("webhook_env", DEFAULT_WEBHOOK_ENV)),
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"'settings' の値が不正です: {exc}") from exc

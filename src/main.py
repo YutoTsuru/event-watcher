@@ -98,7 +98,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         try:
             notifier = DiscordNotifier.from_env(
-                timeout_seconds=config.settings.request_timeout_seconds
+                timeout_seconds=config.settings.request_timeout_seconds,
+                env_var=config.settings.webhook_env,
             )
         except DiscordNotifierError as exc:
             logger.error("Discord Notifier を初期化できません: %s", exc)

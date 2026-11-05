@@ -36,7 +36,9 @@ jobs:
 
       # ランナーは毎回破棄されるため、重複判定用の SQLite をキャッシュで引き継ぐ。
       # キャッシュが失効すると再通知が起きうる点は README の「既知の制約」を参照。
-      - name: Restore event database
+      # 話題ごとに DB が別なので、キャッシュも別にする（actions/cache は path が
+      # 変わると既存のキャッシュを復元できないため、1 つにまとめないこと）。
+      - name: Restore Pokemon database
         uses: actions/cache/restore@v4
         with:
           path: data/events.db
@@ -44,16 +46,45 @@ jobs:
           restore-keys: |
             event-watcher-db-
 
-      - name: Run watcher
+      - name: Restore Haikyu database
+        uses: actions/cache/restore@v4
+        with:
+          path: data/haikyu.db
+          key: event-watcher-haikyu-db-${{ github.run_id }}
+          restore-keys: |
+            event-watcher-haikyu-db-
+
+      # --- ポケモンのコラボ情報（config/targets.yaml）---
+      - name: Run Pokemon watcher
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          python -m src.main --log-level INFO \
-            ${{ inputs.dry_run && '--dry-run' || '' }}
+          python -m src.main --config config/targets.yaml --log-level INFO             ${{ inputs.dry_run && '--dry-run' || '' }}
 
-      - name: Save event database
+      # --- ハイキューのコラボ情報（config/haikyu.yaml）---
+      # ポケモン側が失敗しても実行する。Secret が未登録の間はスキップする。
+      - name: Run Haikyu watcher
+        if: ${{ !cancelled() }}
+        env:
+          DISCORD_WEBHOOK_URL_HAIKYU: ${{ secrets.DISCORD_WEBHOOK_URL_HAIKYU }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL_HAIKYU" ] && [ "$DRY_RUN" != "true" ]; then
+            echo "::warning::DISCORD_WEBHOOK_URL_HAIKYU が未登録のため、ハイキューの監視をスキップします"
+            exit 0
+          fi
+          python -m src.main --config config/haikyu.yaml --log-level INFO             ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: Save Pokemon database
         if: always()
         uses: actions/cache/save@v4
         with:
           path: data/events.db
           key: event-watcher-db-${{ github.run_id }}
+
+      - name: Save Haikyu database
+        if: ${{ always() && hashFiles('data/haikyu.db') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: data/haikyu.db
+          key: event-watcher-haikyu-db-${{ github.run_id }}

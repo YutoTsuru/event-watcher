@@ -13,7 +13,14 @@ RSS フィードを定期的に収集し、`config/targets.yaml` で指定した
 - 公開から `settings.max_article_age_days` 日（既定 3 日）を過ぎた記事は、保存だけして通知しません。
 - GitHub Actions 上で 1 日 2 回（日本時間 9:00 / 21:00）自動実行できます。
 
-現在の `config/targets.yaml` は「ポケモンのコラボ情報」を追う設定になっています（[5. targets.yaml の設定方法](#5-targetsyaml-の設定方法) 参照）。
+現在は 2 つの話題を監視しており、それぞれ別の Discord チャンネルに、同じタイミングで通知します。
+
+| 話題 | 設定ファイル | 通知先（環境変数 / Secret） | DB |
+| --- | --- | --- | --- |
+| ポケモンのコラボ情報 | `config/targets.yaml` | `DISCORD_WEBHOOK_URL` | `data/events.db` |
+| ハイキュー!! のコラボ情報 | `config/haikyu.yaml` | `DISCORD_WEBHOOK_URL_HAIKYU` | `data/haikyu.db` |
+
+設定ファイルの書き方は [5. targets.yaml の設定方法](#5-targetsyaml-の設定方法) を参照してください（`haikyu.yaml` も同じ形式です）。
 
 ## 2. アーキテクチャ
 
@@ -133,7 +140,15 @@ pip install -r requirements.txt
 | `max_notifications_per_run` | 任意 | `20` | 1 回の実行で送る通知件数の上限。超過分は未通知のまま残り、次回以降の実行で送られる。 |
 | `max_article_age_days` | 任意 | `3` | 公開からこの日数を過ぎた記事は保存のみ行い、通知しない（保存はするので、以後同じ記事が流れてきても重複として弾かれる）。公開日時が取れない記事は通知する。`0` 以下で無制限。 |
 | `max_retry_count` | 任意 | `3` | 1 つの記事に対する**送信試行回数**の上限（初回 + 再送）。既定の `3` なら、初回失敗後に 2 回まで再送して諦める。 |
-| `db_path` | 任意 | `data/events.db` | SQLite ファイルのパス（リポジトリルートからの相対パス）。 |
+| `db_path` | 任意 | `data/events.db` | SQLite ファイルのパス（リポジトリルートからの相対パス）。話題ごとに別のファイルにすること。 |
+| `webhook_env` | 任意 | `DISCORD_WEBHOOK_URL` | 通知先 Discord Webhook URL を読む環境変数名。話題ごとにチャンネルを分けるときに変える。 |
+
+### 話題を追加する（別チャンネルに通知する）
+
+1. `config/haikyu.yaml` をコピーして `config/<話題>.yaml` を作り、`feeds` / `targets` / `source_priority` を書き換える。
+2. `settings.db_path` と `settings.webhook_env` を、他の話題と重ならない値にする（例: `data/<話題>.db`、`DISCORD_WEBHOOK_URL_<話題>`）。
+3. 通知先チャンネルで Webhook を作り、その URL を GitHub Secrets に `webhook_env` と同じ名前で登録する。
+4. `.github/workflows/watcher.yml` に、ハイキューと同じ形で「DB の restore / save」と「Run ... watcher」のステップを追加する。
 
 ### source_priority（同じ記事のどの版を残すか、省略可）
 
@@ -237,6 +252,7 @@ python -m pytest -q
 `.github/workflows/watcher.yml` に、1 日 2 回の定期実行（`schedule: cron: "0 0,12 * * *"`。UTC なので日本時間 9:00 / 21:00）と、手動実行（`workflow_dispatch`）が設定済みです。
 
 - 手動実行する場合は GitHub リポジトリの「Actions」タブ →「event-watcher」ワークフロー →「Run workflow」から実行します。
+- ポケモン → ハイキューの順に同じジョブ内で実行します。片方が失敗してももう片方は実行されます。
 - 手動実行時は `dry_run`（真偽値、デフォルト `false`）を入力できます。`true` にすると Discord へ通知せず収集・保存のみ行います。
 
 **重要**: この `.github/` ディレクトリを GitHub Actions に認識させるには、`event-watcher` ディレクトリ自体をリポジトリのルートにする必要があります（`event-watcher` が別リポジトリのサブディレクトリになっている状態では、GitHub Actions はワークフローを検出しません）。
@@ -246,6 +262,7 @@ python -m pytest -q
 1. GitHub リポジトリの「Settings」→「Secrets and variables」→「Actions」を開く。
 2. 「New repository secret」をクリックする。
 3. Name に `DISCORD_WEBHOOK_URL`、Value に取得した Webhook URL を入力して保存する。
+4. ハイキュー用のチャンネルの Webhook も同様に、Name を `DISCORD_WEBHOOK_URL_HAIKYU` にして登録する（未登録の間、ハイキューの監視は警告を出してスキップされます）。
 
 ## 11. 既知の制約 / 注意点
 

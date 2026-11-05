@@ -109,6 +109,18 @@ def test_from_env_builds_notifier_when_env_var_set(monkeypatch: pytest.MonkeyPat
     assert isinstance(notifier, DiscordNotifier)
 
 
+def test_from_env_reads_the_given_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """話題ごとにチャンネルを分けるため、読む環境変数を差し替えられる。"""
+    monkeypatch.delenv(WEBHOOK_ENV_VAR, raising=False)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL_OTHER", "https://discord.example.com/webhook/other")
+
+    notifier = DiscordNotifier.from_env(env_var="DISCORD_WEBHOOK_URL_OTHER")
+
+    assert isinstance(notifier, DiscordNotifier)
+    with pytest.raises(DiscordNotifierError):
+        DiscordNotifier.from_env()
+
+
 def test_notify_success_posts_expected_payload_and_url(monkeypatch: pytest.MonkeyPatch) -> None:
     """成功時: requests.post が正しい URL・payload で呼ばれ、notify は True を返す。"""
     webhook_url = "https://discord.example.com/webhook/xyz"

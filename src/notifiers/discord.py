@@ -1,6 +1,6 @@
 """Discord Webhook への通知。
 
-Webhook URL は環境変数 DISCORD_WEBHOOK_URL から取得する。
+Webhook URL は環境変数（既定は DISCORD_WEBHOOK_URL。設定の settings.webhook_env で変更可）から取得する。
 コード・設定ファイルには絶対に書かないこと。
 
 Discord は 1 メッセージに最大 10 個の embed を載せられる。過去分をまとめて
@@ -51,12 +51,12 @@ class DiscordNotifier(Notifier):
         self._timeout_seconds = timeout_seconds
 
     @classmethod
-    def from_env(cls, timeout_seconds: float = 10.0) -> "DiscordNotifier":
-        webhook_url = os.environ.get(WEBHOOK_ENV_VAR, "").strip()
+    def from_env(
+        cls, timeout_seconds: float = 10.0, env_var: str = WEBHOOK_ENV_VAR
+    ) -> "DiscordNotifier":
+        webhook_url = os.environ.get(env_var, "").strip()
         if not webhook_url:
-            raise DiscordNotifierError(
-                f"環境変数 {WEBHOOK_ENV_VAR} が設定されていません"
-            )
+            raise DiscordNotifierError(f"環境変数 {env_var} が設定されていません")
         return cls(webhook_url, timeout_seconds=timeout_seconds)
 
     def notify(self, event: Event) -> bool:
