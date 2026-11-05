@@ -11,6 +11,7 @@ from pathlib import Path
 
 from src.models import Event, make_content_hash, make_title_key
 from src.repositories.sqlite import SQLiteEventRepository
+from tests.conftest import make_article
 
 
 _UNSET = object()
@@ -338,3 +339,59 @@ def test_initialize_backfills_title_key_for_existing_rows(tmp_path: Path) -> Non
         "別ハッシュ",
         make_title_key("ポケモンとクロックスのコラボが決定しました"),
     ) is True
+
+
+def test_outdated_title_keys_are_recomputed_on_initialize(tmp_path) -> None:
+    """名寄せキーの正規化が変わった古い DB では、保存済みの title_key を作り直す。"""
+    import sqlite3
+
+    from src.models import make_title_key
+    from src.repositories.sqlite import TITLE_KEY_VERSION
+
+    db_path = tmp_path / "old.db"
+    SQLiteEventRepository(db_path).initialize()
+    title = "ミスドとポケモンのコラボが開催決定（GAME Watch） - Yahoo!ニュース"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO events (title, url, source, detected_at, content_hash,"
+            " matched_targets, title_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (title, "https://example.com/x", "s", "2026-11-01T00:00:00+00:00", "h", "[]", "stale"),
+        )
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    SQLiteEventRepository(db_path).initialize()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        (key,) = conn.execute("SELECT title_key FROM events").fetchone()
+        (version,) = conn.execute("PRAGMA user_version").fetchone()
+    finally:
+        conn.close()
+    assert key == make_title_key(title)
+    assert version == TITLE_KEY_VERSION
+
+
+def test_list_title_keys_since_filters_by_detected_at(repository: SQLiteEventRepository) -> None:
+    from datetime import datetime, timezone
+
+    from src.models import Event, make_title_key
+
+    def event(title: str, url: str, detected: datetime) -> Event:
+        return Event.from_article(
+            make_article(title=title, url=url), ["ポケモン"], detected_at=detected
+        )
+
+    repository.save(
+        event("古いポケモンのコラボ記事です", "https://e.com/old", datetime(2026, 1, 1, tzinfo=timezone.utc))
+    )
+    repository.save(
+        event("新しいポケモンのコラボ記事です", "https://e.com/new", datetime(2026, 11, 1, tzinfo=timezone.utc))
+    )
+
+    keys = repository.list_title_keys_since(datetime(2026, 10, 1, tzinfo=timezone.utc))
+
+    assert keys == [make_title_key("新しいポケモンのコラボ記事です")]

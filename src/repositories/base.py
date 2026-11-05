@@ -11,6 +11,7 @@ main.py の組み立て部分だけ差し替えればよい。
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Optional
 
 from src.models import Event, NotificationState
@@ -46,6 +47,13 @@ class EventRepository(ABC):
     @abstractmethod
     def count(self) -> int:
         """保存件数。"""
+
+    @abstractmethod
+    def list_title_keys_since(self, since: datetime) -> list[str]:
+        """検出日時が since 以降のイベントの title_key（空文字は除く）。
+
+        似たタイトルの名寄せに使う。どこまで遡るかは呼び出し側が決める。
+        """
 
 
 class NotificationRepository(ABC):

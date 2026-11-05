@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS events (
 );
 """
 
+# make_title_key の正規化を変えたら上げる。DB 側の値（PRAGMA user_version）が
+# これより古ければ、保存済みの title_key を新しい正規化で計算し直す。
+TITLE_KEY_VERSION = 2
+
 # インデックスは列が揃ってから作る（古い DB では ALTER TABLE の後になる）
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_events_content_hash ON events (content_hash);
@@ -88,6 +92,7 @@ class SQLiteEventRepository(_SQLiteRepositoryBase, EventRepository):
             conn.executescript(SCHEMA)
             _add_missing_columns(conn)
             conn.executescript(INDEXES)
+            _refresh_title_keys_if_outdated(conn)
         logger.info("SQLite を初期化しました: %s", self._db_path)
 
     def exists(self, url: str, content_hash: str, title_key: str = "") -> bool:
@@ -154,6 +159,14 @@ class SQLiteEventRepository(_SQLiteRepositoryBase, EventRepository):
         with self._connect() as conn:
             row = conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()
         return int(row["c"])
+
+    def list_title_keys_since(self, since: datetime) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT title_key FROM events WHERE title_key <> '' AND detected_at >= ?",
+                (_to_iso(since),),
+            ).fetchall()
+        return [row["title_key"] for row in rows]
 
 
 class SQLiteNotificationRepository(_SQLiteRepositoryBase, NotificationRepository):
@@ -277,6 +290,20 @@ def _backfill_title_keys(conn: sqlite3.Connection) -> int:
     updates = [(make_title_key(row["title"]), row["id"]) for row in rows]
     conn.executemany("UPDATE events SET title_key = ? WHERE id = ?", updates)
     return len(updates)
+
+
+def _refresh_title_keys_if_outdated(conn: sqlite3.Connection) -> None:
+    """名寄せキーの正規化が変わっていたら、保存済みの title_key を作り直す。
+
+    古い正規化のままだと、過去に保存した記事と新しく拾った転載記事の
+    キーが食い違い、名寄せをすり抜けて重複通知されてしまう。
+    """
+    current = conn.execute("PRAGMA user_version").fetchone()[0]
+    if current >= TITLE_KEY_VERSION:
+        return
+    refreshed = _backfill_title_keys(conn)
+    conn.execute(f"PRAGMA user_version = {TITLE_KEY_VERSION}")
+    logger.info("名寄せキーを新しい正規化で作り直しました: %d 件", refreshed)
 
 
 def _now_iso() -> str:

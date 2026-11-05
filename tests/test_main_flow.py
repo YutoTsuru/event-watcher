@@ -8,7 +8,9 @@ SQLite は pytest の tmp_path 配下のみを使う。
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import zlib
+
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -18,10 +20,11 @@ from src.collectors.base import Collector
 from src.config import Target
 from src.filters.keyword import KeywordFilter
 from src.main import run
-from src.models import Article
+from src.models import Article, make_content_hash
 from src.notifiers.base import Notifier
 from src.models import Event
 from src.repositories.sqlite import SQLiteEventRepository, SQLiteNotificationRepository
+from src.source_priority import SourcePriority
 
 
 class FakeCollector(Collector):
@@ -59,12 +62,16 @@ class FakeNotifier(Notifier):
         return self._succeed
 
 
+def _title_number(url: str) -> int:
+    """URL ごとに決まる番号（タイトルを記事ごとに変えるためのもの）。"""
+    return zlib.crc32(url.encode("utf-8"))
+
+
 def make_pokemon_article(url: str = "https://example.com/pokemon-1") -> Article:
-    # タイトルでも名寄せされるため、URL が違えば別記事になるようタイトルも変える。
-    # ハイフンは「タイトル - 媒体名」の区切りとみなされるので取り除く
-    slug = url.rsplit("/", 1)[-1].replace("-", "")
+    # タイトルでも名寄せ（完全一致・類似）されるため、URL が違えば別記事になるよう
+    # タイトルも変える。似た見出しでも数字が違えば別記事とみなされるので、URL から番号を作る
     return Article(
-        title=f"新作ポケモンゲームが発表されました（{slug}）",
+        title=f"新作ポケモンゲームが発表されました（第{_title_number(url)}弾）",
         url=url,
         source="フィード1",
         published_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -369,7 +376,7 @@ def test_run_notifies_in_oldest_first_order(
     """通知は公開日時の古い順に並ぶ（日時不明のものは末尾）。"""
     def article(url: str, published: Optional[datetime]) -> Article:
         return Article(
-            title=f"ポケモンコラボ開催のお知らせ（{url.rsplit('/', 1)[-1].replace('-', '')}）",
+            title=f"ポケモンコラボ開催のお知らせ（第{_title_number(url)}弾）",
             url=url,
             source="フィード1",
             published_at=published,
@@ -560,3 +567,205 @@ def test_dispatch_skips_states_whose_event_is_missing(
     assert summary.notified == 0
     assert notifier.batches == []
     assert notif_repo.list_dispatchable(max_retry_count=3, limit=10) == []
+
+
+# --- 類似タイトルの名寄せと、古い記事の通知抑止 ---
+
+
+def _article(title: str, url: str, published_at: Optional[datetime]) -> Article:
+    return Article(
+        title=title, url=url, source="フィード1", published_at=published_at, summary=""
+    )
+
+
+def test_reworded_repost_from_another_feed_is_not_saved_or_notified(
+    repo: SQLiteEventRepository,
+    notif_repo: SQLiteNotificationRepository,
+    keyword_filter: KeywordFilter,
+) -> None:
+    now = datetime.now(timezone.utc)
+    original = _article(
+        "10月24日（土）ご来店予定のお客様へ ポケモンセンター - 公式サイト",
+        "https://example.com/original",
+        now,
+    )
+    repost = _article(
+        "10月24日（土）にご来店予定のお客様へ ポケモンセンター - 別の媒体",
+        "https://example.com/repost",
+        now,
+    )
+    notifier = FakeBatchNotifier(succeed=True)
+
+    summary = run(
+        collectors=[
+            FakeCollector("フィード1", articles=[original]),
+            FakeCollector("フィード2", articles=[repost]),
+        ],
+        relevance_filter=keyword_filter,
+        repository=repo,
+        notification_repository=notif_repo,
+        notifier=notifier,
+        max_notifications=20,
+    )
+
+    assert summary.saved == 1
+    assert summary.near_duplicates == 1
+    assert [e.url for e in notifier.batches[0]] == ["https://example.com/original"]
+
+
+def test_reworded_repost_of_a_previously_saved_article_is_skipped(
+    repo: SQLiteEventRepository,
+    notif_repo: SQLiteNotificationRepository,
+    keyword_filter: KeywordFilter,
+) -> None:
+    """前回の実行で保存した記事の転載も、次の実行で弾かれる。"""
+    now = datetime.now(timezone.utc)
+    first_run_article = _article(
+        "ポケモンとミスドのコラボが11月に開催決定 ピカチュウたちが大集合",
+        "https://example.com/1",
+        now,
+    )
+    second_run_article = _article(
+        "ポケモンとミスドのコラボが11月4日に開催決定 ピカチュウたちが大集合",
+        "https://example.com/2",
+        now,
+    )
+    for article in (first_run_article, second_run_article):
+        summary = run(
+            collectors=[FakeCollector("フィード1", articles=[article])],
+            relevance_filter=keyword_filter,
+            repository=repo,
+            notification_repository=notif_repo,
+            notifier=FakeBatchNotifier(succeed=True),
+            max_notifications=20,
+        )
+
+    assert summary.saved == 0
+    assert summary.near_duplicates == 1
+    assert repo.count() == 1
+
+
+def test_old_articles_are_saved_but_not_notified(
+    repo: SQLiteEventRepository,
+    notif_repo: SQLiteNotificationRepository,
+    keyword_filter: KeywordFilter,
+) -> None:
+    now = datetime.now(timezone.utc)
+    fresh = _article(
+        "ポケモンのコラボカフェが本日オープンしました",
+        "https://example.com/fresh",
+        now - timedelta(days=1),
+    )
+    old = _article(
+        "ポケモンのポップアップストアが渋谷で開催中です",
+        "https://example.com/old",
+        now - timedelta(days=10),
+    )
+    undated = _article(
+        "ポケモンの限定グッズが全国の店舗で発売されます", "https://example.com/undated", None
+    )
+    notifier = FakeBatchNotifier(succeed=True)
+
+    summary = run(
+        collectors=[FakeCollector("フィード1", articles=[fresh, old, undated])],
+        relevance_filter=keyword_filter,
+        repository=repo,
+        notification_repository=notif_repo,
+        notifier=notifier,
+        max_notifications=20,
+        max_article_age_days=3,
+    )
+
+    assert summary.saved == 3  # 古い記事も保存はする（以後の重複判定のため）
+    assert summary.too_old == 1
+    notified = {e.url for e in notifier.batches[0]}
+    # 公開日時が分からない記事は古いとみなさない
+    assert notified == {"https://example.com/fresh", "https://example.com/undated"}
+    assert notif_repo.get(make_content_hash(old.title, old.url)) is None
+
+    # 次の実行で同じ古い記事が流れてきても、保存済みなので通知されない
+    again = run(
+        collectors=[FakeCollector("フィード1", articles=[old])],
+        relevance_filter=keyword_filter,
+        repository=repo,
+        notification_repository=notif_repo,
+        notifier=FakeBatchNotifier(succeed=True),
+        max_notifications=20,
+        max_article_age_days=3,
+    )
+    assert again.saved == 0
+    assert again.notified == 0
+
+
+# --- 媒体の優先順位（同じ記事のどの版を残すか） ---
+
+
+def test_preferred_outlet_version_is_kept_even_if_it_arrives_later(
+    repo: SQLiteEventRepository,
+    notif_repo: SQLiteNotificationRepository,
+    keyword_filter: KeywordFilter,
+) -> None:
+    """転載（Yahoo!）が先のフィードに来ても、優先媒体（GAME Watch）の版を残す。"""
+    now = datetime.now(timezone.utc)
+    via_yahoo = _article(
+        "ミスド「ポケモン」コラボが11月に開催決定！ピカチュウたちが大集合（GAME Watch） - Yahoo!ニュース",
+        "https://example.com/yahoo",
+        now,
+    )
+    original = _article(
+        "ミスド「ポケモン」コラボが11月に開催決定！ピカチュウたちが大集合 - GAME Watch",
+        "https://example.com/gamewatch",
+        now,
+    )
+    notifier = FakeBatchNotifier(succeed=True)
+
+    summary = run(
+        collectors=[
+            FakeCollector("フィード1", articles=[via_yahoo]),
+            FakeCollector("フィード2", articles=[original]),
+        ],
+        relevance_filter=keyword_filter,
+        repository=repo,
+        notification_repository=notif_repo,
+        notifier=notifier,
+        max_notifications=20,
+        source_priority=SourcePriority(
+            preferred=["GAME Watch"], deprioritized=["Yahoo!ニュース"]
+        ),
+    )
+
+    assert summary.saved == 1
+    assert [e.url for e in notifier.batches[0]] == ["https://example.com/gamewatch"]
+
+
+def test_version_with_summary_wins_when_outlets_rank_equally(
+    repo: SQLiteEventRepository,
+    notif_repo: SQLiteNotificationRepository,
+    keyword_filter: KeywordFilter,
+) -> None:
+    now = datetime.now(timezone.utc)
+    without_summary = _article(
+        "ポケモンとクロックスのコラボが決定しました - 媒体A", "https://example.com/a", now
+    )
+    with_summary = Article(
+        title="ポケモンとクロックスのコラボが決定しました - 媒体B",
+        url="https://example.com/b",
+        source="フィード2",
+        published_at=now,
+        summary="11月から全国で発売。",
+    )
+    notifier = FakeBatchNotifier(succeed=True)
+
+    run(
+        collectors=[
+            FakeCollector("フィード1", articles=[without_summary]),
+            FakeCollector("フィード2", articles=[with_summary]),
+        ],
+        relevance_filter=keyword_filter,
+        repository=repo,
+        notification_repository=notif_repo,
+        notifier=notifier,
+        max_notifications=20,
+    )
+
+    assert [e.url for e in notifier.batches[0]] == ["https://example.com/b"]

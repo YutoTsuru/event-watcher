@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_NOTIFICATIONS_PER_RUN = 20
 DEFAULT_MAX_RETRY_COUNT = 3
+# 公開からこの日数を過ぎた記事は保存のみで通知しない（0 以下なら無制限）
+DEFAULT_MAX_ARTICLE_AGE_DAYS = 3
 DEFAULT_DB_PATH = "data/events.db"
 
 
@@ -52,7 +54,20 @@ class Settings:
     max_notifications_per_run: int = DEFAULT_MAX_NOTIFICATIONS_PER_RUN
     # 通知失敗イベントを再送する最大回数（これを超えたら再送しない）
     max_retry_count: int = DEFAULT_MAX_RETRY_COUNT
+    # 公開からこの日数を過ぎた記事は、保存（＝以後の重複判定）だけして通知しない。
+    # 0 以下なら日数で絞らない。
+    max_article_age_days: float = DEFAULT_MAX_ARTICLE_AGE_DAYS
     db_path: str = DEFAULT_DB_PATH
+
+
+@dataclass(frozen=True)
+class SourcePriorityConfig:
+    """同じ記事が複数の媒体から届いたとき、どの媒体の版を残すか。"""
+
+    # 上から順に優先して残す媒体
+    preferred: list[str] = field(default_factory=list)
+    # 他に版があればそちらを残したい媒体（転載サイトなど）
+    deprioritized: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -60,6 +75,7 @@ class AppConfig:
     feeds: list[FeedConfig]
     targets: list[Target]
     settings: Settings = field(default_factory=Settings)
+    source_priority: SourcePriorityConfig = field(default_factory=SourcePriorityConfig)
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -80,6 +96,7 @@ def load_config(path: str | Path) -> AppConfig:
         feeds=_parse_feeds(raw.get("feeds")),
         targets=_parse_targets(raw.get("targets")),
         settings=_parse_settings(raw.get("settings")),
+        source_priority=_parse_source_priority(raw.get("source_priority")),
     )
     logger.info(
         "設定を読み込みました: feeds=%d, targets=%d", len(config.feeds), len(config.targets)
@@ -131,6 +148,21 @@ def _parse_targets(raw_targets: Any) -> list[Target]:
     return targets
 
 
+def _parse_source_priority(raw: Any) -> SourcePriorityConfig:
+    if raw is None:
+        return SourcePriorityConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'source_priority' はマッピングである必要があります")
+
+    lists: dict[str, list[str]] = {}
+    for key in ("preferred", "deprioritized"):
+        value = raw.get(key) or []
+        if not isinstance(value, list):
+            raise ConfigError(f"'source_priority.{key}' はリストである必要があります")
+        lists[key] = [str(name) for name in value]
+    return SourcePriorityConfig(**lists)
+
+
 def _parse_settings(raw_settings: Any) -> Settings:
     if raw_settings is None:
         return Settings()
@@ -146,6 +178,9 @@ def _parse_settings(raw_settings: Any) -> Settings:
                 raw_settings.get("max_notifications_per_run", DEFAULT_MAX_NOTIFICATIONS_PER_RUN)
             ),
             max_retry_count=int(raw_settings.get("max_retry_count", DEFAULT_MAX_RETRY_COUNT)),
+            max_article_age_days=float(
+                raw_settings.get("max_article_age_days", DEFAULT_MAX_ARTICLE_AGE_DAYS)
+            ),
             db_path=str(raw_settings.get("db_path", DEFAULT_DB_PATH)),
         )
     except (TypeError, ValueError) as exc:

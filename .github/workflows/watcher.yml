@@ -2,8 +2,8 @@ name: event-watcher
 
 on:
   schedule:
-    # MVP なので 6 時間ごと（UTC）。頻度を上げすぎない。
-    - cron: "0 */6 * * *"
+    # 1日2回（UTC 0:00 / 12:00 = JST 9:00 / 21:00）
+    - cron: "0 0,12 * * *"
   workflow_dispatch:
     inputs:
       dry_run:

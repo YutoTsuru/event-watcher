@@ -17,7 +17,7 @@ import argparse
 import logging
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
 
 from src.collectors.base import Collector
@@ -27,15 +27,20 @@ from src.filters.base import RelevanceFilter
 from src.filters.feed_requirement import FeedRequirementFilter
 from src.filters.keyword import KeywordFilter
 from src.logging_config import setup_logging
-from src.models import Article, Event, NotificationState
+from src.models import Article, Event, NotificationState, is_similar_title_key
 from src.notifiers.base import Notifier
 from src.notifiers.discord import DiscordNotifier, DiscordNotifierError
 from src.repositories.base import EventRepository, NotificationRepository
 from src.repositories.sqlite import SQLiteEventRepository, SQLiteNotificationRepository
+from src.source_priority import SourcePriority
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = "config/targets.yaml"
+
+# 似たタイトルの名寄せで、どこまで過去の保存済み記事と比べるか。
+# Google ニュースの検索フィードが when:30d で遡るので、それより少し長めにとる。
+SIMILAR_TITLE_LOOKBACK_DAYS = 45
 
 EXIT_OK = 0
 EXIT_FATAL = 2
@@ -52,12 +57,17 @@ class RunSummary:
     notify_failed: int = 0
     # 通知したもののうち、過去の実行で失敗して再送になった件数
     retried: int = 0
+    # 似たタイトルの記事が保存済みだったため、転載とみなして捨てた件数
+    near_duplicates: int = 0
+    # 公開から日数が経っていたため、保存だけして通知しなかった件数
+    too_old: int = 0
 
     def as_log_message(self) -> str:
         return (
             f"実行結果: 取得={self.collected} 一致={self.matched} "
             f"新規保存={self.saved} 通知成功={self.notified} "
-            f"通知失敗={self.notify_failed} うち再送={self.retried}"
+            f"通知失敗={self.notify_failed} うち再送={self.retried} "
+            f"類似タイトル除外={self.near_duplicates} 古い記事で通知せず={self.too_old}"
         )
 
 
@@ -105,6 +115,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         notifier=notifier,
         max_notifications=config.settings.max_notifications_per_run,
         max_retry_count=config.settings.max_retry_count,
+        max_article_age_days=config.settings.max_article_age_days,
+        source_priority=SourcePriority(
+            preferred=config.source_priority.preferred,
+            deprioritized=config.source_priority.deprioritized,
+        ),
     )
     logger.info(summary.as_log_message())
     return EXIT_OK
@@ -145,6 +160,8 @@ def run(
     notifier: Optional[Notifier],
     max_notifications: int,
     max_retry_count: int = 3,
+    max_article_age_days: float = 0,
+    source_priority: Optional[SourcePriority] = None,
 ) -> RunSummary:
     """収集から通知までの 1 サイクル。
 
@@ -152,7 +169,13 @@ def run(
     """
     summary = RunSummary()
     detected_at = datetime.now(timezone.utc)
+    # 今回保存した分も足していくので、同じ実行内の別フィードどうしも名寄せされる
+    known_title_keys = _load_recent_title_keys(repository, detected_at)
+    notify_cutoff = (
+        detected_at - timedelta(days=max_article_age_days) if max_article_age_days > 0 else None
+    )
 
+    candidates: list[Event] = []
     for collector in collectors:
         articles = _collect_safely(collector)
         summary.collected += len(articles)
@@ -162,12 +185,28 @@ def run(
             if event is None:
                 continue
             summary.matched += 1
+            candidates.append(event)
 
-            if not _save_safely(repository, event):
-                continue
-            summary.saved += 1
-            # この時点では未通知。実際の送信は収集がすべて終わってから行う
-            _mark_pending_safely(notification_repository, event.content_hash)
+    # 同じ記事が複数の媒体から届いたら、良い版から先に保存する。
+    # 後から来た版は下の重複判定（完全一致・類似）で弾かれるので、良い版だけが残る
+    for event in _best_versions_first(candidates, source_priority or SourcePriority()):
+        if _has_similar_title(event, known_title_keys):
+            summary.near_duplicates += 1
+            logger.debug("似たタイトルの記事が保存済みのためスキップします: %s", event.title)
+            continue
+
+        if not _save_safely(repository, event):
+            continue
+        summary.saved += 1
+        if event.title_key:
+            known_title_keys.append(event.title_key)
+
+        if _is_too_old(event, notify_cutoff):
+            # 保存はしてあるので、以後この記事が再び流れてきても重複として弾かれる
+            summary.too_old += 1
+            continue
+        # この時点では未通知。実際の送信は収集がすべて終わってから行う
+        _mark_pending_safely(notification_repository, event.content_hash)
 
     if notifier is None:
         return summary
@@ -340,6 +379,52 @@ def _to_event_if_matched(
     if not matched:
         return None
     return Event.from_article(article, matched, detected_at=detected_at)
+
+
+def _best_versions_first(events: Sequence[Event], priority: SourcePriority) -> list[Event]:
+    """同じ記事の版のうち、残したいものが先に来るよう並べる。
+
+    1. 媒体の優先順位（config の source_priority）が高い
+    2. 要約を持っている（通知本文に要約を載せられる）
+    3. config の feeds で先に書かれたフィード（元の並び。sorted は安定ソート）
+    """
+    return sorted(events, key=lambda event: (priority.rank_event(event), not event.summary))
+
+
+def _load_recent_title_keys(repository: EventRepository, now: datetime) -> list[str]:
+    """似たタイトルの名寄せに使う、最近保存した記事の title_key。
+
+    取得に失敗しても実行は止めない（完全一致の名寄せは exists 側で効く）。
+    """
+    since = now - timedelta(days=SIMILAR_TITLE_LOOKBACK_DAYS)
+    try:
+        return list(repository.list_title_keys_since(since))
+    except Exception:
+        logger.exception("名寄せ用タイトルの取得に失敗しました。類似判定なしで続行します")
+        return []
+
+
+def _has_similar_title(event: Event, known_title_keys: Sequence[str]) -> bool:
+    """同じ記事の転載（見出しが少しだけ違う）が保存済みかどうか。
+
+    完全一致は exists 側で判定するので、ここでは「似ているが同一ではない」ものを拾う。
+    """
+    if not event.title_key:
+        return False
+    return any(
+        key != event.title_key and is_similar_title_key(event.title_key, key)
+        for key in known_title_keys
+    )
+
+
+def _is_too_old(event: Event, cutoff: Optional[datetime]) -> bool:
+    """公開日時が cutoff より前か。公開日時が分からない記事は古いとみなさない。"""
+    if cutoff is None or event.published_at is None:
+        return False
+    published = event.published_at
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    return published < cutoff
 
 
 def _save_safely(repository: EventRepository, event: Event) -> bool:
