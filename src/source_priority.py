@@ -7,28 +7,12 @@
 
 from __future__ import annotations
 
-import re
-import unicodedata
 from typing import Sequence
 
 from src.models import Event
+from src.titles import normalize_name, outlet_name
 
-# Google ニュース経由の見出し末尾「 - 媒体名」
-_OUTLET_SUFFIX_PATTERN = re.compile(r"\s-\s([^-]{2,30})$")
-
-
-def outlet_name(title: str, source: str) -> str:
-    """記事の配信元媒体名。
-
-    Google ニュース経由なら見出し末尾の「 - 媒体名」、直接ソースのフィードなら
-    フィード名（config の feeds[].name）をそのまま媒体名とみなす。
-    """
-    match = _OUTLET_SUFFIX_PATTERN.search(title.strip())
-    return _normalize(match.group(1) if match else source)
-
-
-def _normalize(name: str) -> str:
-    return unicodedata.normalize("NFKC", name).strip().lower()
+__all__ = ["SourcePriority", "outlet_name"]
 
 
 class SourcePriority:
@@ -42,8 +26,8 @@ class SourcePriority:
     def __init__(
         self, preferred: Sequence[str] = (), deprioritized: Sequence[str] = ()
     ) -> None:
-        self._preferred = {_normalize(name): i for i, name in enumerate(preferred)}
-        self._deprioritized = {_normalize(name): i for i, name in enumerate(deprioritized)}
+        self._preferred = {normalize_name(name): i for i, name in enumerate(preferred)}
+        self._deprioritized = {normalize_name(name): i for i, name in enumerate(deprioritized)}
 
     def rank(self, title: str, source: str) -> int:
         name = outlet_name(title, source)

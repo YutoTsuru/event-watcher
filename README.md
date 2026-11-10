@@ -12,7 +12,7 @@ RSS フィードを定期的に収集し、`config/targets.yaml` で指定した
 - 通知の成否は `notifications` テーブルに記録され、**送れなかった記事は次回実行で自動的に再送されます**（上限 `settings.max_retry_count` 回）。
 - 公開から `settings.max_article_age_days` 日（既定 3 日）を過ぎた記事は、保存だけして通知しません。
 - 同じコラボを複数の媒体が報じた記事は、最初の 1 件だけ通知します（通知から `event_grouping.window_days` 日の間、同じ出来事の記事は保存のみ）。
-- GitHub Actions 上で 1 日 2 回（日本時間 9:00 / 21:00）自動実行できます。
+- 1 日 2 回（日本時間 9:00 / 21:00）、cron-job.org から GitHub Actions を起動して自動実行します（GitHub 自体の定期実行は数時間遅れることがあるため。[9. GitHub Actions の設定方法](#9-github-actions-の設定方法) 参照）。
 
 現在は 2 つの話題を監視しており、それぞれ別の Discord チャンネルに、同じタイミングで通知します。
 
@@ -31,15 +31,20 @@ RSS フィードを定期的に収集し、`config/targets.yaml` で指定した
 event-watcher/
 ├── .github/
 │   └── workflows/
-│       └── watcher.yml     # GitHub Actions（定期実行 + 手動実行）
+│       └── watcher.yml     # GitHub Actions（cron-job.org からの起動 + 予備の定期実行 + 手動実行）
 ├── config/
-│   └── targets.yaml        # 収集元フィード・監視対象・実行設定
+│   ├── targets.yaml        # ポケモン: 収集元フィード・監視対象・実行設定
+│   └── haikyu.yaml         # ハイキュー!!: 同上（通知先チャンネルと DB は別）
 ├── data/
-│   └── events.db           # SQLite ファイル（.gitignore 対象、実行時に自動生成）
+│   ├── events.db           # ポケモン用 SQLite（.gitignore 対象、実行時に自動生成）
+│   └── haikyu.db           # ハイキュー用 SQLite（同上）
 ├── src/
 │   ├── main.py             # フローの組み立てとエントリポイント
-│   ├── config.py           # targets.yaml の読み込み・検証
-│   ├── models.py           # Article / Event などの共有ドメインモデル
+│   ├── config.py           # 設定 YAML の読み込み・検証
+│   ├── models.py           # Article / Event などの共有ドメインモデル、名寄せキー
+│   ├── titles.py           # 見出しの配信元表記（「 - 媒体名」など）の扱い
+│   ├── source_priority.py  # 同じ記事のどの媒体の版を残すか
+│   ├── event_grouping.py   # 同じ出来事（同じコラボ）の記事の判定
 │   ├── logging_config.py   # ログ設定
 │   ├── collectors/
 │   │   ├── base.py         # Collector の抽象基底クラス
@@ -52,6 +57,7 @@ event-watcher/
 │   │   ├── base.py         # Notifier の抽象基底クラス
 │   │   └── discord.py      # Discord Webhook 通知の実装
 │   └── repositories/
+│       ├── base.py         # Repository の抽象基底クラス
 │       └── sqlite.py       # SQLite への保存・取得
 ├── tests/                  # pytest テストコード
 ├── pytest.ini              # pytest 設定（testpaths / pythonpath）
@@ -67,15 +73,27 @@ event-watcher/
 | Filter（`src/filters/`） | 判定のみ。`Article` が監視対象に一致するか判定し、一致した対象名のリストを返す。`FeedRequirementFilter` は `KeywordFilter` を包み、フィードごとの必須キーワードを前段で適用する。 |
 | Repository（`src/repositories/`） | 保存取得のみ。`EventRepository` が「何が起きたか」（`events`）、`NotificationRepository` が「通知できたか」（`notifications`）を担当する。判定や通知のロジックは持たない。 |
 | Notifier（`src/notifiers/`） | 通知のみ。`Event` を Discord Webhook に送信する（`notify_batch` で 10 件ずつまとめ送信）。保存や重複判定は行わない。 |
+| `titles` / `source_priority` / `event_grouping`（`src/`） | 見出しを使った判定のみ。配信元表記の除去、媒体の優先順位、同じ出来事かどうかの判定を行う。保存や通知は行わない。 |
 | `src/main.py` | フロー。上記の各コンポーネントを組み立て、収集→判定→重複排除→保存→通知の流れを制御する。個々の失敗でループ全体を止めない。 |
 
 ### 処理フロー
 
 ```
-収集（RSSCollector） → キーワード判定（KeywordFilter） → 重複排除（SQLiteEventRepository.exists）
-    → SQLite保存（events） → 未通知として記録（notifications: pending）
-    → まとめてDiscord通知（DiscordNotifier.notify_batch） → 結果を記録（notifications: sent / failed）
+1. 収集（RSSCollector）→ キーワード判定（FeedRequirementFilter / KeywordFilter）
+2. 同じ記事の版を「良い順」に並べる（source_priority → 要約の有無 → feeds の並び順）
+3. 1 件ずつ:
+     保存済み（URL / content_hash / title_key が一致）     → 何もしない
+     新しい記事 → events に保存したうえで、通知するかを決める
+        似たタイトルの記事が保存済み（転載）               → 通知しない
+        公開から max_article_age_days 日を過ぎている        → 通知しない
+        window_days 日以内に通知した記事と同じ出来事        → 通知しない
+        それ以外                                             → 未通知として記録（notifications: pending）
+4. まとめて Discord 通知（DiscordNotifier.notify_batch）→ 結果を記録（notifications: sent / failed）
 ```
+
+**新しい記事は、通知しないものも含めてすべて保存します。** 保存しておけば、次回以降に同じ記事が
+フィードに残っていても「保存済み」として即座に弾けるので、判定をやり直したり、
+古い記事を後から通知してしまったりすることがありません。
 
 通知は記事 1 件ごとには送らず、全フィードの収集・保存が終わってから最後にまとめて送ります
 （1 件 1 リクエストだと過去分の一括通知でレート制限に掛かるため）。
@@ -90,6 +108,8 @@ event-watcher/
 テーブルも Repository も分かれており、`content_hash` で紐づいています。
 
 各段階の失敗は個別に catch してログに残し、他のフィード・記事の処理は継続します（`src/main.py` の `_collect_safely` / `_save_safely` など）。
+
+通知するかどうかの判定（古い記事・同じ出来事）は `src/main.py` の `_NotificationGate`、転載の判定は `_TitleIndex` にまとまっています。
 
 ## 3. 必要環境
 
@@ -116,7 +136,7 @@ pip install -r requirements.txt
 
 ## 5. targets.yaml の設定方法
 
-設定ファイルは `config/targets.yaml`（`--config` で別のパスも指定可）。トップレベルに `feeds` / `targets` / `settings` の 3 キーを持ちます。
+設定ファイルは `config/targets.yaml`（`--config` で別のパスも指定可。ハイキューは `config/haikyu.yaml`）。トップレベルに必須の `feeds` / `targets` と、任意の `settings` / `source_priority` / `event_grouping` を持ちます。
 
 ### feeds（収集元 RSS/Atom フィード）
 
@@ -266,11 +286,34 @@ python -m pytest -q
 
 ## 9. GitHub Actions の設定方法
 
-`.github/workflows/watcher.yml` に、1 日 2 回の定期実行（`schedule: cron: "0 0,12 * * *"`。UTC なので日本時間 9:00 / 21:00）と、手動実行（`workflow_dispatch`）が設定済みです。
+`.github/workflows/watcher.yml` は、次の 3 通りで起動します。
 
-- 手動実行する場合は GitHub リポジトリの「Actions」タブ →「event-watcher」ワークフロー →「Run workflow」から実行します。
-- ポケモン → ハイキューの順に同じジョブ内で実行します。片方が失敗してももう片方は実行されます。
-- 手動実行時は `dry_run`（真偽値、デフォルト `false`）を入力できます。`true` にすると Discord へ通知せず収集・保存のみ行います。
+| 起動方法 | 時刻 | 役割 |
+| --- | --- | --- |
+| **cron-job.org からの起動**（`workflow_dispatch`） | 日本時間 9:00 / 21:00 | **本番の起動**。ほぼ時刻どおりに動く。 |
+| GitHub の定期実行（`schedule: cron: "0 0,12 * * *"`） | UTC 0:00 / 12:00（日本時間 9:00 / 21:00） | **予備**。混雑時は数時間遅れたり飛んだりする（実測で 3〜9 時間遅れ）。 |
+| 手動実行（「Actions」タブ →「event-watcher」→「Run workflow」） | 任意 | 動作確認用。`dry_run` を `true` にすると通知せず収集・保存のみ。 |
+
+起動が重なっても、`concurrency` で同時には走らず、重複判定があるので同じ記事が二重に届くことはありません。
+1 回の実行の中で、ポケモン → ハイキューの順に処理します。片方が失敗してももう片方は実行されます。
+
+### cron-job.org の設定（本番の起動）
+
+cron-job.org は「決まった時刻に GitHub の API を呼ぶ」目覚まし時計の役だけをします。記事の収集や Discord への通知は、今までどおり GitHub Actions 上のこのプログラムが行います。
+
+1. **GitHub でトークンを作る**: Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token
+   - Repository access: **Only select repositories** で `event-watcher` だけ
+   - Permissions: Repositories の **Actions** を **Read and write**（他は追加しない）
+   - Expiration: 1 年程度（Custom で日付指定）
+2. **cron-job.org でジョブを作る**
+   - URL: `https://api.github.com/repos/YutoTsuru/event-watcher/actions/workflows/watcher.yml/dispatches`
+   - Schedule: Custom で `0 9,21 * * *`（Time zone: `Asia/Tokyo`）
+   - Request method: `POST`
+   - Headers: `Authorization: Bearer <トークン>` / `Accept: application/vnd.github+json` / `Content-Type: application/json`
+   - Request body: `{"ref":"main"}`
+   - TEST RUN で **204 No Content** が返れば成功（GitHub の「Actions」タブに `workflow_dispatch` の実行が増える）
+
+**現在のトークンの有効期限は 2027/11/11 です。** 期限が切れると cron-job.org からの起動が失敗し（401）、遅れがちな GitHub の定期実行だけになります。期限前に 1. で新しいトークンを作り、cron-job.org の `Authorization` ヘッダーを差し替えてください。
 
 **重要**: この `.github/` ディレクトリを GitHub Actions に認識させるには、`event-watcher` ディレクトリ自体をリポジトリのルートにする必要があります（`event-watcher` が別リポジトリのサブディレクトリになっている状態では、GitHub Actions はワークフローを検出しません）。
 
@@ -281,21 +324,59 @@ python -m pytest -q
 3. Name に `DISCORD_WEBHOOK_URL`、Value に取得した Webhook URL を入力して保存する。
 4. ハイキュー用のチャンネルの Webhook も同様に、Name を `DISCORD_WEBHOOK_URL_HAIKYU` にして登録する（未登録の間、ハイキューの監視は警告を出してスキップされます）。
 
-## 11. 既知の制約 / 注意点
+## 11. 運用（動作確認とトラブルシューティング）
 
-- **SQLite の永続化について**: GitHub Actions のランナーは実行のたびに破棄されるため、重複判定用の SQLite（`data/events.db`）は `actions/cache` を使って実行間で引き継いでいます。キャッシュが失効・削除された場合は重複判定の履歴が失われ、過去に通知済みの記事が再通知される可能性があります。恒久的な運用では、DB ファイルをリポジトリにコミットする方式や、外部データベース（例: マネージドな SQL/KVS サービス）への移行を検討してください。
+### 実行結果の見方
+
+各話題の実行の最後に、次の 1 行がログに出ます（GitHub の「Actions」タブ → 実行 → `Run Pokemon watcher` / `Run Haikyu watcher`）。
+
+```
+実行結果: 取得=541 一致=179 新規保存=2 通知成功=1 通知失敗=0 うち再送=0 類似タイトル除外=0 古い記事で通知せず=0 同じ出来事で通知せず=1
+```
+
+| 項目 | 意味 |
+| --- | --- |
+| 取得 / 一致 | フィードから取れた記事数 / そのうち監視対象のキーワードに一致した数 |
+| 新規保存 | 初めて見た記事の数（以下の 3 項目と、通知対象になったものの合計） |
+| 類似タイトル除外 | 保存済み記事の転載（見出しが少しだけ違う）とみなして通知しなかった数 |
+| 古い記事で通知せず | 公開から `max_article_age_days` 日を過ぎていて通知しなかった数 |
+| 同じ出来事で通知せず | `window_days` 日以内に通知したコラボと同じとみなして通知しなかった数 |
+| 通知成功 / 通知失敗 / うち再送 | Discord への送信結果（前回までの積み残し・再送分を含む） |
+
+新着が無い回は「新規保存=0」で、他の項目もすべて 0 になるのが正常です。
+
+ターミナルからは `gh` で確認できます。
+
+```bash
+gh run list --workflow watcher.yml --limit 5               # 最近の実行（event 列で起動方法が分かる）
+gh run view <run-id> --log | grep 実行結果                  # 各話題の実行結果
+```
+
+### よくある症状
+
+| 症状 | 確認すること |
+| --- | --- |
+| 通知が予定時刻に来ない | `gh run list` で `workflow_dispatch` の実行があるか。無ければ cron-job.org のジョブ履歴（History）を見る。401 ならトークンの期限切れ。 |
+| ハイキューだけ来ない | ログに「`DISCORD_WEBHOOK_URL_HAIKYU` が未登録」の警告が出ていないか（Secret の登録漏れ）。 |
+| 見たかったコラボが来ない | 「同じ出来事で通知せず」で止められた可能性。別のコラボと共通している語を `event_grouping.stopwords` に足す。 |
+| 同じコラボが何度も来る | コラボ相手の表記ゆれ（「ミスド」「ミスタードーナツ」）やひらがな表記。現状のロジックではまとめられない（[既知の制約](#12-既知の制約--注意点)）。 |
+| 過去の記事が大量に届いた | DB のキャッシュが消えた可能性（下記「SQLite の永続化」）。`max_article_age_days` より古い記事は届かない。 |
+
+## 12. 既知の制約 / 注意点
+
+- **SQLite の永続化について**: GitHub Actions のランナーは実行のたびに破棄されるため、重複判定用の SQLite（`data/events.db` / `data/haikyu.db`）は `actions/cache` を使って実行間で引き継いでいます（話題ごとに別のキャッシュ。7 日間使われないキャッシュは GitHub に削除されますが、毎日実行していれば消えません）。キャッシュが失効・削除された場合は重複判定の履歴が失われ、過去に通知済みの記事が再通知される可能性があります。恒久的な運用では、DB ファイルをリポジトリにコミットする方式や、外部データベース（例: マネージドな SQL/KVS サービス）への移行を検討してください。
 - **再送上限を超えた記事は諦める**: `max_retry_count` 回の送信試行がすべて失敗した記事は、それ以降は再送されません（無限に再送し続けないため）。該当があれば実行ログに警告が出ます。
 - **まとめ送信の粒度**: 通知は 10 件で 1 リクエストのため、成否も 10 件単位でしか分かりません。1 リクエストが失敗すると、その 10 件すべてが「通知失敗」として記録され、次回まとめて再送されます。
 - **既存 DB との互換性**: `notifications` テーブルは初回実行時に自動作成されます。この機構より前に保存済みだったイベントには通知状態の行が無いため、再送対象にはなりません（＝過去に通知済みのものが再送される心配はありません）。
 - **同じコラボの名寄せは見出しの語だけで判定している**: `event_grouping` は形態素解析も LLM も使わず、文字種の境目で区切った語の一致だけを見ています。そのため、(1) 見出しにコラボ相手の名前がひらがなでしか出ない（「しまむら」など）、共通する固有名詞が 1 つしかない、といった記事はまとめられずに別々に通知されることがあります。逆に (2) 同じコラボ相手の別の商品（「サンキューマート」の第2弾と第3弾など）は、`window_days` の間は 1 件にまとめられます。
 - **Google ニュース RSS への依存**: 現在の `feeds` の主力は Google ニュースの検索 RSS です。1 クエリあたり最大 100 件で、仕様変更やクエリ構文の解釈に影響を受けます（`when:30d` の遡り幅も同様）。
 - **要約が付くのは一部の記事だけ**: 通知本文の要約は、フィードが要約を持っている場合にのみ表示されます。Google ニュースの検索 RSS が `summary` として返すのは**タイトルと媒体名を繰り返す `<a>` タグだけ**で、要約としての中身がありません（記事ページも JS リダイレクトのため取得できません）。要約を持つのは直接ソースのフィード（GAME Watch / ITmedia / PR TIMES / マイナビニュース / ケータイ Watch）だけですが、そこにポケモンのコラボ記事が流れてくる頻度は低く、**実測では通知全体の 1〜2% 程度**にとどまります。中身の無い要約は `clean_summary()` が空文字に落とすため、「タイトルの焼き直し」が本文に出ることはありません。すべての通知に要約を付けるには、記事本文を取得したうえで LLM に要約させる仕組みが必要です。
-- **重複排除の範囲**: 重複判定は URL・`content_hash`（タイトル + URL）に加えて、`title_key`（タイトルを正規化した名寄せキー）で行います。`title_key` は全角・半角を揃え、タイトル末尾の配信元表記（「 - 朝日新聞」「｜ファミ通」など）と転載時の付け足し（「（GAME Watch） - Yahoo!ニュース」「(2026年11月4日掲載)」）を落とし、記号と空白を無視したものです。さらに、過去 45 日に保存した記事と `title_key` の類似度が 0.85 以上なら同じ記事の転載とみなします（「10月24日ご来店予定の」と「10月24日にご来店予定の」など）。ただし見出し中の数字が食い違うもの（「第1弾」と「第2弾」、日付違いの告知）は別記事として扱います。**見出しがはっきり異なれば別記事として扱われる**ため、同じコラボを各媒体が独自の見出しで報じた場合は、それぞれ通知されます。正規化後が短いタイトル（既定 10 文字未満）は誤って別記事どうしを一致させないよう名寄せの対象外です。名寄せキーの正規化を変えたときは `TITLE_KEY_VERSION`（`src/repositories/sqlite.py`）を上げると、既存 DB のキーが起動時に作り直されます。
-- **同じ記事のどの版を残すか**: 同じ記事を複数の媒体・フィードが拾った場合は、`config/targets.yaml` の `source_priority`（媒体の優先順位）→ 要約の有無 → `feeds` の並び順、の順で 1 つを選んで残し、他は名寄せで弾きます。媒体名は Google ニュース経由なら見出し末尾の「 - 媒体名」、直接ソースならフィード名です。選び直すのは同じ実行の中だけで、**既に通知済みの記事を後から来た良い版に差し替えることはしません**（再通知になってしまうため）。また、見やすさ・情報量を自動で測っているわけではなく、優先順位は設定で決めた好みです。
+- **重複排除の範囲**: 重複判定は URL・`content_hash`（タイトル + URL）に加えて、`title_key`（タイトルを正規化した名寄せキー）で行います。`title_key` は全角・半角を揃え、タイトル末尾の配信元表記（「 - 朝日新聞」「｜ファミ通」など）と転載時の付け足し（「（GAME Watch） - Yahoo!ニュース」「(2026年11月4日掲載)」）を落とし、記号と空白を無視したものです。さらに、過去 45 日に保存した記事と `title_key` の類似度が 0.85 以上なら同じ記事の転載とみなします（「10月24日ご来店予定の」と「10月24日にご来店予定の」など）。ただし見出し中の数字が食い違うもの（「第1弾」と「第2弾」、日付違いの告知）は別記事として扱います。転載とみなした記事も保存はします（通知はしない）。見出しがはっきり異なる記事（同じコラボを各媒体が独自の見出しで報じたもの）は、ここではなく `event_grouping` でまとめます。正規化後が短いタイトル（既定 10 文字未満）は誤って別記事どうしを一致させないよう名寄せの対象外です。名寄せキーの正規化を変えたときは `TITLE_KEY_VERSION`（`src/repositories/sqlite.py`）を上げると、既存 DB のキーが起動時に作り直されます。
+- **同じ記事のどの版を残すか**: 同じ記事を複数の媒体・フィードが拾った場合は、設定ファイルの `source_priority`（媒体の優先順位）→ 要約の有無 → `feeds` の並び順、の順で 1 つを選んで残し、他は名寄せで弾きます。媒体名は Google ニュース経由なら見出し末尾の「 - 媒体名」、直接ソースならフィード名です。選び直すのは同じ実行の中だけで、**既に通知済みの記事を後から来た良い版に差し替えることはしません**（再通知になってしまうため）。また、見やすさ・情報量を自動で測っているわけではなく、優先順位は設定で決めた好みです。
 - **キーワード判定の精度について**: `KeywordFilter` は部分一致による判定であり、形態素解析は行っていません。日本語のキーワードは部分一致で概ね機能しますが、英単語（例: `Pokemon`）は無関係な文脈でも一致してしまう（誤検知する）可能性があります。
 - **初回実行時の通知量について**: 初回実行時は SQLite に何も保存されていないため、既存のフィード内の記事が大量に一致・通知され得ます。`max_article_age_days` で古い記事は通知されませんが、加えて `settings.max_notifications_per_run`（デフォルト 20 件）で 1 回あたりの通知件数を制限しています。上限を超えた一致記事は保存したうえで未通知（pending）のまま残り、次回以降の実行で順次送られます（取りこぼしはしませんが、初回の積み残しを送り切るまで数回の実行にまたがります）。
 
-## 12. 今後の拡張候補
+## 13. 今後の拡張候補
 
 - LLM による関連性判定の追加: `src/filters/base.py` の `RelevanceFilter` を実装した `LLMRelevanceFilter`（仮）を追加し、`main.py` 側で `KeywordFilter` と差し替える。
 - RSS 以外の Collector の追加: `src/collectors/base.py` の `Collector` を実装し、API 収集やスクレイピングなど別の情報源に対応する。

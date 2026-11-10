@@ -23,10 +23,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -39,7 +39,7 @@ jobs:
       # 話題ごとに DB が別なので、キャッシュも別にする（actions/cache は path が
       # 変わると既存のキャッシュを復元できないため、1 つにまとめないこと）。
       - name: Restore Pokemon database
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: data/events.db
           key: event-watcher-db-${{ github.run_id }}
@@ -47,7 +47,7 @@ jobs:
             event-watcher-db-
 
       - name: Restore Haikyu database
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: data/haikyu.db
           key: event-watcher-haikyu-db-${{ github.run_id }}
@@ -77,14 +77,14 @@ jobs:
 
       - name: Save Pokemon database
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: data/events.db
           key: event-watcher-db-${{ github.run_id }}
 
       - name: Save Haikyu database
         if: ${{ always() && hashFiles('data/haikyu.db') != '' }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: data/haikyu.db
           key: event-watcher-haikyu-db-${{ github.run_id }}

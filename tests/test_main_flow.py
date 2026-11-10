@@ -19,7 +19,7 @@ import pytest
 from src.collectors.base import Collector
 from src.config import Target
 from src.filters.keyword import KeywordFilter
-from src.main import run
+from src.main import RunSummary, run
 from src.models import Article, make_content_hash
 from src.notifiers.base import Notifier
 from src.models import Event
@@ -579,7 +579,7 @@ def _article(title: str, url: str, published_at: Optional[datetime]) -> Article:
     )
 
 
-def test_reworded_repost_from_another_feed_is_not_saved_or_notified(
+def test_reworded_repost_from_another_feed_is_saved_but_not_notified(
     repo: SQLiteEventRepository,
     notif_repo: SQLiteNotificationRepository,
     keyword_filter: KeywordFilter,
@@ -609,17 +609,18 @@ def test_reworded_repost_from_another_feed_is_not_saved_or_notified(
         max_notifications=20,
     )
 
-    assert summary.saved == 1
+    # 転載も保存はする（次回以降に exists で即座に弾けるように）が、通知はしない
+    assert summary.saved == 2
     assert summary.near_duplicates == 1
     assert [e.url for e in notifier.batches[0]] == ["https://example.com/original"]
 
 
-def test_reworded_repost_of_a_previously_saved_article_is_skipped(
+def test_reworded_repost_of_a_previously_saved_article_is_not_notified(
     repo: SQLiteEventRepository,
     notif_repo: SQLiteNotificationRepository,
     keyword_filter: KeywordFilter,
 ) -> None:
-    """前回の実行で保存した記事の転載も、次の実行で弾かれる。"""
+    """前回の実行で保存した記事の転載も、次の実行で通知されない。"""
     now = datetime.now(timezone.utc)
     first_run_article = _article(
         "ポケモンとミスドのコラボが11月に開催決定 ピカチュウたちが大集合",
@@ -632,8 +633,40 @@ def test_reworded_repost_of_a_previously_saved_article_is_skipped(
         now,
     )
     for article in (first_run_article, second_run_article):
+        notifier = FakeBatchNotifier(succeed=True)
         summary = run(
             collectors=[FakeCollector("フィード1", articles=[article])],
+            relevance_filter=keyword_filter,
+            repository=repo,
+            notification_repository=notif_repo,
+            notifier=notifier,
+            max_notifications=20,
+        )
+
+    assert summary.near_duplicates == 1
+    assert summary.notified == 0
+    assert notifier.batches == []
+
+
+def test_repost_is_counted_only_once_across_runs(
+    repo: SQLiteEventRepository,
+    notif_repo: SQLiteNotificationRepository,
+    keyword_filter: KeywordFilter,
+) -> None:
+    """同じ転載がフィードに残り続けても、2 回目以降は保存済みとして素通りする。
+
+    以前は転載を保存しなかったため、フィードに残っている間ずっと
+    「類似タイトル除外」として数え直し、類似度の計算も毎回やり直していた。
+    """
+    now = datetime.now(timezone.utc)
+    articles = [
+        _article("ポケモンとミスドのコラボが11月に開催決定 ピカチュウたちが大集合", "https://example.com/1", now),
+        _article("ポケモンとミスドのコラボが11月4日に開催決定 ピカチュウたちが大集合", "https://example.com/2", now),
+    ]
+
+    def run_once() -> RunSummary:
+        return run(
+            collectors=[FakeCollector("フィード1", articles=articles)],
             relevance_filter=keyword_filter,
             repository=repo,
             notification_repository=notif_repo,
@@ -641,9 +674,13 @@ def test_reworded_repost_of_a_previously_saved_article_is_skipped(
             max_notifications=20,
         )
 
-    assert summary.saved == 0
-    assert summary.near_duplicates == 1
-    assert repo.count() == 1
+    first = run_once()
+    second = run_once()
+
+    assert first.near_duplicates == 1
+    assert second.near_duplicates == 0
+    assert second.saved == 0
+    assert second.notified == 0
 
 
 def test_old_articles_are_saved_but_not_notified(

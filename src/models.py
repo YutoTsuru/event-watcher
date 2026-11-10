@@ -8,23 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import re
-import unicodedata
-from difflib import SequenceMatcher
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
-# タイトル末尾に付く配信元の表記（「 - 朝日新聞」「｜ファミ通」など）
-_SOURCE_SUFFIX_PATTERN = re.compile(r"\s*[-–—|｜]\s*[^-–—|｜]{2,25}\s*$")
-# 転載で末尾に付く括弧書き。「（第2弾）」のように見出しの一部である括弧まで
-# 剥がさないよう、確認できている転載の形だけに限る。
-#   Yahoo!ニュース   : 「タイトル（媒体名） - Yahoo!ニュース」
-#   ライブドアニュース: 「タイトル (2026年11月4日掲載) - ライブドアニュース」
-_YAHOO_SUFFIX_PATTERN = re.compile(r"\s*[(（][^()（）]{1,25}[)）]\s*-\s*Yahoo!ニュース\s*$")
-_POSTED_DATE_PATTERN = re.compile(r"\s*[(（]\d{4}年\d{1,2}月\d{1,2}日掲載[)）]")
-# 末尾の配信元表記を剥がす最大回数（「…｜カテゴリ - 媒体名」のように重なることがある）
-_MAX_SUFFIX_STRIPS = 2
+from src.titles import strip_source_suffixes
+
 _NUMBER_PATTERN = re.compile(r"\d+")
 # title_key どうしがこれ以上似ていれば、同じ記事の転載とみなす
 TITLE_SIMILARITY_THRESHOLD = 0.85
@@ -133,15 +124,7 @@ def make_title_key(title: str) -> str:
     正規化後が短い場合は空文字を返して名寄せの対象外にする
     （空文字のキーは重複判定に使わない）。
     """
-    # 全角・半角の揺れ（「！」と「!」など）を先に揃える
-    text = unicodedata.normalize("NFKC", title).strip()
-    text = _YAHOO_SUFFIX_PATTERN.sub("", text)
-    text = _POSTED_DATE_PATTERN.sub("", text)
-    for _ in range(_MAX_SUFFIX_STRIPS):
-        stripped = _SOURCE_SUFFIX_PATTERN.sub("", text)
-        if stripped == text:
-            break
-        text = stripped
+    text = strip_source_suffixes(title)
     normalized = re.sub(r"\W+", "", text, flags=re.UNICODE).lower()
     if len(normalized) < MIN_TITLE_KEY_LENGTH:
         return ""

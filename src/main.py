@@ -18,11 +18,13 @@ import logging
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Optional, Sequence
 
 from src.collectors.base import Collector
 from src.collectors.rss import RSSCollector
 from src.config import AppConfig, ConfigError, load_config
+from src.event_grouping import EventGrouper, EventSignature
 from src.filters.base import RelevanceFilter
 from src.filters.feed_requirement import FeedRequirementFilter
 from src.filters.keyword import KeywordFilter
@@ -32,7 +34,6 @@ from src.notifiers.base import Notifier
 from src.notifiers.discord import DiscordNotifier, DiscordNotifierError
 from src.repositories.base import EventRepository, NotificationRepository
 from src.repositories.sqlite import SQLiteEventRepository, SQLiteNotificationRepository
-from src.event_grouping import EventGrouper, EventSignature
 from src.source_priority import SourcePriority
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ class RunSummary:
     notify_failed: int = 0
     # 通知したもののうち、過去の実行で失敗して再送になった件数
     retried: int = 0
-    # 似たタイトルの記事が保存済みだったため、転載とみなして捨てた件数
+    # 似たタイトルの記事が保存済みだったため、転載とみなして保存だけした件数
     near_duplicates: int = 0
     # 公開から日数が経っていたため、保存だけして通知しなかった件数
     too_old: int = 0
@@ -184,22 +185,14 @@ def run(
     """
     summary = RunSummary()
     detected_at = datetime.now(timezone.utc)
-    # 今回保存した分も足していくので、同じ実行内の別フィードどうしも名寄せされる
-    known_title_keys = _load_recent_title_keys(repository, detected_at)
-    notify_cutoff = (
-        detected_at - timedelta(days=max_article_age_days) if max_article_age_days > 0 else None
-    )
-    # 最近通知した記事の特徴語。これと同じ出来事の記事は通知しない
-    grouper = event_grouper if event_window_days > 0 else None
-    notified_event_tokens = (
-        _load_recent_notified_tokens(
-            repository,
-            notification_repository,
-            grouper,
-            detected_at - timedelta(days=event_window_days),
-        )
-        if grouper is not None
-        else []
+    title_index = _TitleIndex(_load_recent_title_keys(repository, detected_at))
+    gate = _NotificationGate.build(
+        repository,
+        notification_repository,
+        now=detected_at,
+        max_article_age_days=max_article_age_days,
+        event_grouper=event_grouper,
+        event_window_days=event_window_days,
     )
 
     candidates: list[Event] = []
@@ -217,30 +210,32 @@ def run(
     # 同じ記事が複数の媒体から届いたら、良い版から先に保存する。
     # 後から来た版は下の重複判定（完全一致・類似）で弾かれるので、良い版だけが残る
     for event in _best_versions_first(candidates, source_priority or SourcePriority()):
-        if _has_similar_title(event, known_title_keys):
-            summary.near_duplicates += 1
-            logger.debug("似たタイトルの記事が保存済みのためスキップします: %s", event.title)
+        if _is_saved_safely(repository, event):
             continue
 
+        # 似たタイトル（転載）の判定は保存より前に行う。保存すると自分自身と比べてしまうため
+        is_repost = title_index.has_similar(event)
         if not _save_safely(repository, event):
             continue
         summary.saved += 1
-        if event.title_key:
-            known_title_keys.append(event.title_key)
+        title_index.add(event)
 
-        if _is_too_old(event, notify_cutoff):
-            # 保存はしてあるので、以後この記事が再び流れてきても重複として弾かれる
+        # 新しい記事は通知しないものも含めてすべて保存する。保存しておけば、
+        # 次回以降に同じ記事が流れてきても exists で即座に弾ける（毎回判定し直さない）
+        if is_repost:
+            summary.near_duplicates += 1
+            logger.debug("似たタイトルの記事が保存済みのため通知しません: %s", event.title)
+            continue
+        reason = gate.reason_to_skip(event)
+        if reason is _SkipReason.TOO_OLD:
             summary.too_old += 1
             continue
+        if reason is _SkipReason.SAME_EVENT:
+            summary.same_event += 1
+            logger.debug("同じ出来事を通知済みのため通知しません: %s", event.title)
+            continue
 
-        if grouper is not None:
-            tokens = grouper.signature(event.title)
-            if any(grouper.is_same_event(tokens, known) for known in notified_event_tokens):
-                summary.same_event += 1
-                logger.debug("同じ出来事を通知済みのため通知しません: %s", event.title)
-                continue
-            notified_event_tokens.append(tokens)
-
+        gate.remember(event)
         # この時点では未通知。実際の送信は収集がすべて終わってから行う
         _mark_pending_safely(notification_repository, event.content_hash)
 
@@ -304,12 +299,9 @@ def _published_sort_key(event: Event) -> tuple[int, datetime]:
     公開日時が取れなかったものは末尾に回す。Collector によっては tz なしの
     日時が来るかもしれないので、その場合は UTC とみなして比較する。
     """
-    published = event.published_at
-    if published is None:
+    if event.published_at is None:
         return (1, datetime.min.replace(tzinfo=timezone.utc))
-    if published.tzinfo is None:
-        published = published.replace(tzinfo=timezone.utc)
-    return (0, published)
+    return (0, _as_utc(event.published_at))
 
 
 def _notify_safely(
@@ -427,13 +419,96 @@ def _best_versions_first(events: Sequence[Event], priority: SourcePriority) -> l
     return sorted(events, key=lambda event: (priority.rank_event(event), not event.summary))
 
 
-def _load_recent_notified_tokens(
+class _SkipReason(Enum):
+    """新しく保存した記事を通知しない理由。"""
+
+    TOO_OLD = "too_old"
+    SAME_EVENT = "same_event"
+
+
+class _TitleIndex:
+    """似たタイトル（同じ記事の転載）の判定に使う、最近保存した記事の title_key。
+
+    完全一致は exists 側で判定するので、ここでは「似ているが同一ではない」ものを拾う。
+    今回保存した分も足していくので、同じ実行内の別フィードどうしも名寄せされる。
+    """
+
+    def __init__(self, title_keys: Sequence[str]) -> None:
+        self._keys = list(title_keys)
+
+    def has_similar(self, event: Event) -> bool:
+        if not event.title_key:
+            return False
+        return any(
+            key != event.title_key and is_similar_title_key(event.title_key, key)
+            for key in self._keys
+        )
+
+    def add(self, event: Event) -> None:
+        if event.title_key:
+            self._keys.append(event.title_key)
+
+
+@dataclass
+class _NotificationGate:
+    """新しく保存した記事を通知するかどうかを決める。
+
+    - 公開から max_article_age_days 日を過ぎた記事は通知しない
+    - 最近（event_window_days 日以内に）通知した記事と同じ出来事なら通知しない
+    """
+
+    cutoff: Optional[datetime]
+    grouper: Optional[EventGrouper]
+    notified: list[EventSignature]
+
+    @classmethod
+    def build(
+        cls,
+        repository: EventRepository,
+        notification_repository: NotificationRepository,
+        now: datetime,
+        max_article_age_days: float,
+        event_grouper: Optional[EventGrouper],
+        event_window_days: float,
+    ) -> "_NotificationGate":
+        cutoff = now - timedelta(days=max_article_age_days) if max_article_age_days > 0 else None
+        grouper = event_grouper if event_window_days > 0 else None
+        notified = (
+            _load_recent_notified_signatures(
+                repository,
+                notification_repository,
+                grouper,
+                since=now - timedelta(days=event_window_days),
+            )
+            if grouper is not None
+            else []
+        )
+        return cls(cutoff=cutoff, grouper=grouper, notified=notified)
+
+    def reason_to_skip(self, event: Event) -> Optional[_SkipReason]:
+        """通知しない理由。通知してよければ None。"""
+        if self.cutoff is not None and event.published_at is not None:
+            if _as_utc(event.published_at) < self.cutoff:
+                return _SkipReason.TOO_OLD
+        if self.grouper is not None:
+            signature = self.grouper.signature(event.title)
+            if any(self.grouper.is_same_event(signature, known) for known in self.notified):
+                return _SkipReason.SAME_EVENT
+        return None
+
+    def remember(self, event: Event) -> None:
+        """通知することにした記事を覚え、同じ実行内の同じ出来事も止める。"""
+        if self.grouper is not None:
+            self.notified.append(self.grouper.signature(event.title))
+
+
+def _load_recent_notified_signatures(
     repository: EventRepository,
     notification_repository: NotificationRepository,
     grouper: EventGrouper,
     since: datetime,
 ) -> list[EventSignature]:
-    """since 以降に通知した（通知対象にした）記事の特徴語。
+    """since 以降に通知した（通知対象にした）記事の判定材料。
 
     「保存したが通知しなかった記事」（古い記事・同じ出来事の続報）は含めない。
     含めると、記事が出続ける限り同じ出来事の判定が延々と延長され、
@@ -461,35 +536,26 @@ def _load_recent_title_keys(repository: EventRepository, now: datetime) -> list[
         return []
 
 
-def _has_similar_title(event: Event, known_title_keys: Sequence[str]) -> bool:
-    """同じ記事の転載（見出しが少しだけ違う）が保存済みかどうか。
+def _as_utc(value: datetime) -> datetime:
+    """tz なしの日時は UTC とみなす（Collector によっては tz なしで来ることがある）。"""
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
-    完全一致は exists 側で判定するので、ここでは「似ているが同一ではない」ものを拾う。
+
+def _is_saved_safely(repository: EventRepository, event: Event) -> bool:
+    """URL / content_hash / title_key のいずれかで保存済みなら True。
+
+    確認に失敗したときも True を返して、この記事は今回は扱わない（次回また判定される）。
     """
-    if not event.title_key:
-        return False
-    return any(
-        key != event.title_key and is_similar_title_key(event.title_key, key)
-        for key in known_title_keys
-    )
-
-
-def _is_too_old(event: Event, cutoff: Optional[datetime]) -> bool:
-    """公開日時が cutoff より前か。公開日時が分からない記事は古いとみなさない。"""
-    if cutoff is None or event.published_at is None:
-        return False
-    published = event.published_at
-    if published.tzinfo is None:
-        published = published.replace(tzinfo=timezone.utc)
-    return published < cutoff
+    try:
+        return repository.exists(event.url, event.content_hash, event.title_key)
+    except Exception:
+        logger.exception("保存済みかどうかの確認に失敗しました url=%s", event.url)
+        return True
 
 
 def _save_safely(repository: EventRepository, event: Event) -> bool:
-    """新規保存できたら True。既知 / 保存失敗なら False（通知対象にしない）。"""
+    """新規保存できたら True。保存失敗なら False（通知対象にしない）。"""
     try:
-        if repository.exists(event.url, event.content_hash, event.title_key):
-            logger.debug("保存済みのためスキップします: %s", event.url)
-            return False
         return repository.save(event)
     except Exception:
         logger.exception("保存に失敗しました url=%s", event.url)

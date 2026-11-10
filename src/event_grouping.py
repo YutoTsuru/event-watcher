@@ -20,9 +20,10 @@ LLM や形態素解析を使わない、文字種の境目だけを使った軽�
 from __future__ import annotations
 
 import re
-import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Optional
+
+from src.titles import normalize_name, strip_source_suffixes
 
 # 同じ出来事とみなすのに必要な共有特徴語の数（コラボ相手が一致しない場合）
 MIN_SHARED_TOKENS = 2
@@ -44,11 +45,6 @@ pop up store shop cafe collab collaboration the and ver new official limited goo
 campaign online gallery
 """.split()
 
-# 見出し末尾の配信元表記（「 - 媒体名」「｜カテゴリ」）。何重にも付くことがある
-_SUFFIX_PATTERN = re.compile(r"\s*[-–—|｜]\s*[^-–—|｜]{2,40}\s*$")
-_YAHOO_SUFFIX_PATTERN = re.compile(r"\s*[(（][^()（）]{1,25}[)）]\s*-\s*Yahoo!ニュース\s*$")
-_MAX_SUFFIX_STRIPS = 3
-
 # 特徴語の候補: カタカナの連なり / 漢字の連なり / 英字で始まる英数字の連なり
 # （× は Latin-1 の範囲にあるので英字から外す）
 _TOKEN = r"[ァ-ヴー]{2,}|[一-龥々]{2,}|[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ0-9]+"
@@ -60,10 +56,6 @@ _TOKEN_AT_START = re.compile(rf"(?:{_TOKEN})")
 _CROSS_PATTERN = re.compile(r"\s*[×✕]\s*|\s+x\s+")
 # 「×」と相手の名前の間に挟まる括弧・記号（「『ハイキュー!!』×「モスバーガー」」など）
 _CROSS_PADDING = " 　「」『』【】()（）\"'“”‘’!！?？・、。&＆"
-
-
-def _normalize(text: str) -> str:
-    return unicodedata.normalize("NFKC", text).lower()
 
 
 @dataclass(frozen=True)
@@ -84,14 +76,14 @@ class EventGrouper:
     """
 
     def __init__(self, stopwords: Iterable[str] = ()) -> None:
-        words = {_normalize(w) for w in [*GENERIC_WORDS, *stopwords] if w.strip()}
+        words = {normalize_name(w) for w in [*GENERIC_WORDS, *stopwords] if w.strip()}
         # 長い語から削らないと、「コラボレーション」が「コラボ」で先に削られて
         # 「レーション」が残ってしまう
         self._stopwords = sorted(words, key=len, reverse=True)
         self._stopword_set = set(words)
 
     def signature(self, title: str) -> EventSignature:
-        text = _strip_outlet(title)
+        text = strip_source_suffixes(title).lower()
         return EventSignature(tokens=self._tokens(text), partners=self._partners(text))
 
     def is_same_event(self, a: EventSignature, b: EventSignature) -> bool:
@@ -144,18 +136,6 @@ class EventGrouper:
             for part in word.split()
             if len(part) >= MIN_TOKEN_LENGTH and part not in self._stopword_set
         ]
-
-
-def _strip_outlet(title: str) -> str:
-    # Yahoo! の表記は大文字小文字を区別して照合するので、小文字化はその後
-    text = unicodedata.normalize("NFKC", title).strip()
-    text = _YAHOO_SUFFIX_PATTERN.sub("", text).lower()
-    for _ in range(_MAX_SUFFIX_STRIPS):
-        stripped = _SUFFIX_PATTERN.sub("", text)
-        if stripped == text:
-            break
-        text = stripped
-    return text
 
 
 def _same_word(a: str, b: str) -> bool:

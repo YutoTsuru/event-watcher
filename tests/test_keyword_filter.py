@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from src.config import Target
 from src.filters.keyword import KeywordFilter
-from src.models import Article
 from tests.conftest import make_article
 
 
