@@ -32,6 +32,7 @@ from src.notifiers.base import Notifier
 from src.notifiers.discord import DiscordNotifier, DiscordNotifierError
 from src.repositories.base import EventRepository, NotificationRepository
 from src.repositories.sqlite import SQLiteEventRepository, SQLiteNotificationRepository
+from src.event_grouping import EventGrouper, EventSignature
 from src.source_priority import SourcePriority
 
 logger = logging.getLogger(__name__)
@@ -61,13 +62,16 @@ class RunSummary:
     near_duplicates: int = 0
     # 公開から日数が経っていたため、保存だけして通知しなかった件数
     too_old: int = 0
+    # 同じ出来事（同じコラボ）を最近通知済みだったため、保存だけして通知しなかった件数
+    same_event: int = 0
 
     def as_log_message(self) -> str:
         return (
             f"実行結果: 取得={self.collected} 一致={self.matched} "
             f"新規保存={self.saved} 通知成功={self.notified} "
             f"通知失敗={self.notify_failed} うち再送={self.retried} "
-            f"類似タイトル除外={self.near_duplicates} 古い記事で通知せず={self.too_old}"
+            f"類似タイトル除外={self.near_duplicates} 古い記事で通知せず={self.too_old} "
+            f"同じ出来事で通知せず={self.same_event}"
         )
 
 
@@ -121,6 +125,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             preferred=config.source_priority.preferred,
             deprioritized=config.source_priority.deprioritized,
         ),
+        event_grouper=build_event_grouper(config),
+        event_window_days=config.event_grouping.window_days,
     )
     logger.info(summary.as_log_message())
     return EXIT_OK
@@ -136,6 +142,12 @@ def build_collectors(config: AppConfig) -> list[Collector]:
         )
         for feed in config.feeds
     ]
+
+
+def build_event_grouper(config: AppConfig) -> EventGrouper:
+    """同じ出来事の判定器。監視対象のキーワードは話題そのものなので特徴語から外す。"""
+    keywords = [keyword for target in config.targets for keyword in target.keywords]
+    return EventGrouper(stopwords=[*keywords, *config.event_grouping.stopwords])
 
 
 def build_filter(config: AppConfig) -> RelevanceFilter:
@@ -163,6 +175,8 @@ def run(
     max_retry_count: int = 3,
     max_article_age_days: float = 0,
     source_priority: Optional[SourcePriority] = None,
+    event_grouper: Optional[EventGrouper] = None,
+    event_window_days: float = 0,
 ) -> RunSummary:
     """収集から通知までの 1 サイクル。
 
@@ -174,6 +188,18 @@ def run(
     known_title_keys = _load_recent_title_keys(repository, detected_at)
     notify_cutoff = (
         detected_at - timedelta(days=max_article_age_days) if max_article_age_days > 0 else None
+    )
+    # 最近通知した記事の特徴語。これと同じ出来事の記事は通知しない
+    grouper = event_grouper if event_window_days > 0 else None
+    notified_event_tokens = (
+        _load_recent_notified_tokens(
+            repository,
+            notification_repository,
+            grouper,
+            detected_at - timedelta(days=event_window_days),
+        )
+        if grouper is not None
+        else []
     )
 
     candidates: list[Event] = []
@@ -206,6 +232,15 @@ def run(
             # 保存はしてあるので、以後この記事が再び流れてきても重複として弾かれる
             summary.too_old += 1
             continue
+
+        if grouper is not None:
+            tokens = grouper.signature(event.title)
+            if any(grouper.is_same_event(tokens, known) for known in notified_event_tokens):
+                summary.same_event += 1
+                logger.debug("同じ出来事を通知済みのため通知しません: %s", event.title)
+                continue
+            notified_event_tokens.append(tokens)
+
         # この時点では未通知。実際の送信は収集がすべて終わってから行う
         _mark_pending_safely(notification_repository, event.content_hash)
 
@@ -390,6 +425,27 @@ def _best_versions_first(events: Sequence[Event], priority: SourcePriority) -> l
     3. config の feeds で先に書かれたフィード（元の並び。sorted は安定ソート）
     """
     return sorted(events, key=lambda event: (priority.rank_event(event), not event.summary))
+
+
+def _load_recent_notified_tokens(
+    repository: EventRepository,
+    notification_repository: NotificationRepository,
+    grouper: EventGrouper,
+    since: datetime,
+) -> list[EventSignature]:
+    """since 以降に通知した（通知対象にした）記事の特徴語。
+
+    「保存したが通知しなかった記事」（古い記事・同じ出来事の続報）は含めない。
+    含めると、記事が出続ける限り同じ出来事の判定が延々と延長され、
+    window_days を過ぎても新しい続報（発売開始など）が通知されなくなるため。
+    """
+    try:
+        notified = notification_repository.list_hashes_created_since(since)
+        events = repository.list_since(since)
+    except Exception:
+        logger.exception("通知済み記事の取得に失敗しました。同じ出来事の判定なしで続行します")
+        return []
+    return [grouper.signature(event.title) for event in events if event.content_hash in notified]
 
 
 def _load_recent_title_keys(repository: EventRepository, now: datetime) -> list[str]:

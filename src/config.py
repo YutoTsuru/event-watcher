@@ -23,6 +23,8 @@ DEFAULT_MAX_ARTICLE_AGE_DAYS = 3
 DEFAULT_DB_PATH = "data/events.db"
 # 通知先 Discord Webhook URL を読む環境変数（話題ごとにチャンネルを分けるときに変える）
 DEFAULT_WEBHOOK_ENV = "DISCORD_WEBHOOK_URL"
+# 通知した記事からこの日数の間、同じ出来事（同じコラボ）の記事は通知しない
+DEFAULT_EVENT_WINDOW_DAYS = 7
 
 
 class ConfigError(Exception):
@@ -75,11 +77,23 @@ class SourcePriorityConfig:
 
 
 @dataclass(frozen=True)
+class EventGroupingConfig:
+    """同じ出来事（同じコラボ）を報じた別媒体の記事をまとめる設定。"""
+
+    # 通知した記事からこの日数の間、同じ出来事の記事は通知しない（0 以下で無効）
+    window_days: float = DEFAULT_EVENT_WINDOW_DAYS
+    # 特徴語から除く、話題そのものを表す語（キャラクター名など）。
+    # targets のキーワードは自動で含まれるので書かなくてよい
+    stopwords: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class AppConfig:
     feeds: list[FeedConfig]
     targets: list[Target]
     settings: Settings = field(default_factory=Settings)
     source_priority: SourcePriorityConfig = field(default_factory=SourcePriorityConfig)
+    event_grouping: EventGroupingConfig = field(default_factory=EventGroupingConfig)
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -101,6 +115,7 @@ def load_config(path: str | Path) -> AppConfig:
         targets=_parse_targets(raw.get("targets")),
         settings=_parse_settings(raw.get("settings")),
         source_priority=_parse_source_priority(raw.get("source_priority")),
+        event_grouping=_parse_event_grouping(raw.get("event_grouping")),
     )
     logger.info(
         "設定を読み込みました: feeds=%d, targets=%d", len(config.feeds), len(config.targets)
@@ -165,6 +180,24 @@ def _parse_source_priority(raw: Any) -> SourcePriorityConfig:
             raise ConfigError(f"'source_priority.{key}' はリストである必要があります")
         lists[key] = [str(name) for name in value]
     return SourcePriorityConfig(**lists)
+
+
+def _parse_event_grouping(raw: Any) -> EventGroupingConfig:
+    if raw is None:
+        return EventGroupingConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'event_grouping' はマッピングである必要があります")
+
+    stopwords = raw.get("stopwords") or []
+    if not isinstance(stopwords, list):
+        raise ConfigError("'event_grouping.stopwords' はリストである必要があります")
+    try:
+        window_days = float(raw.get("window_days", DEFAULT_EVENT_WINDOW_DAYS))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"'event_grouping.window_days' の値が不正です: {exc}") from exc
+    return EventGroupingConfig(
+        window_days=window_days, stopwords=[str(word) for word in stopwords]
+    )
 
 
 def _parse_settings(raw_settings: Any) -> Settings:

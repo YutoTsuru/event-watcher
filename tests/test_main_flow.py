@@ -24,6 +24,7 @@ from src.models import Article, make_content_hash
 from src.notifiers.base import Notifier
 from src.models import Event
 from src.repositories.sqlite import SQLiteEventRepository, SQLiteNotificationRepository
+from src.event_grouping import EventGrouper
 from src.source_priority import SourcePriority
 
 
@@ -769,3 +770,85 @@ def test_version_with_summary_wins_when_outlets_rank_equally(
     )
 
     assert [e.url for e in notifier.batches[0]] == ["https://example.com/b"]
+
+
+# --- 同じ出来事（同じコラボ）の記事をまとめる ---
+
+
+def _run_grouped(repo, notif_repo, keyword_filter, articles, notifier, window_days=7):
+    return run(
+        collectors=[FakeCollector("フィード1", articles=articles)],
+        relevance_filter=keyword_filter,
+        repository=repo,
+        notification_repository=notif_repo,
+        notifier=notifier,
+        max_notifications=20,
+        event_grouper=EventGrouper(stopwords=["ポケモン"]),
+        event_window_days=window_days,
+    )
+
+
+def test_articles_about_the_same_collab_are_notified_once(
+    repo: SQLiteEventRepository,
+    notif_repo: SQLiteNotificationRepository,
+    keyword_filter: KeywordFilter,
+) -> None:
+    now = datetime.now(timezone.utc)
+    first = _article("ミスド×ポケモンのコラボが開催決定 ヤドンのドーナツも登場", "https://example.com/1", now)
+    second = _article("ミスタードーナツでポケモンの新作ドーナツ、ミスドの店頭に並ぶヤドン", "https://example.com/2", now)
+    other = _article("しまむら×ポケモンのパジャマが全国で発売されます", "https://example.com/3", now)
+    notifier = FakeBatchNotifier(succeed=True)
+
+    summary = _run_grouped(repo, notif_repo, keyword_filter, [first, second, other], notifier)
+
+    assert summary.saved == 3  # まとめた記事も保存はする（以後の重複判定のため）
+    assert summary.same_event == 1
+    assert {e.url for e in notifier.batches[0]} == {
+        "https://example.com/1",
+        "https://example.com/3",
+    }
+
+
+def test_same_collab_in_a_later_run_is_not_notified_within_the_window(
+    repo: SQLiteEventRepository,
+    notif_repo: SQLiteNotificationRepository,
+    keyword_filter: KeywordFilter,
+) -> None:
+    now = datetime.now(timezone.utc)
+    _run_grouped(
+        repo,
+        notif_repo,
+        keyword_filter,
+        [_article("ミスド×ポケモンのコラボが開催決定 ヤドンのドーナツも登場", "https://example.com/1", now)],
+        FakeBatchNotifier(succeed=True),
+    )
+    notifier = FakeBatchNotifier(succeed=True)
+
+    summary = _run_grouped(
+        repo,
+        notif_repo,
+        keyword_filter,
+        [_article("ミスドでポケモンのドーナツが本日から店頭販売", "https://example.com/2", now)],
+        notifier,
+    )
+
+    assert summary.same_event == 1
+    assert notifier.batches == []
+
+
+def test_grouping_is_disabled_when_window_is_zero(
+    repo: SQLiteEventRepository,
+    notif_repo: SQLiteNotificationRepository,
+    keyword_filter: KeywordFilter,
+) -> None:
+    now = datetime.now(timezone.utc)
+    articles = [
+        _article("ミスド×ポケモンのコラボが開催決定 ヤドンのドーナツも登場", "https://example.com/1", now),
+        _article("ミスドでポケモンのドーナツが本日から店頭販売", "https://example.com/2", now),
+    ]
+    notifier = FakeBatchNotifier(succeed=True)
+
+    summary = _run_grouped(repo, notif_repo, keyword_filter, articles, notifier, window_days=0)
+
+    assert summary.same_event == 0
+    assert len(notifier.batches[0]) == 2

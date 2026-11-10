@@ -160,6 +160,14 @@ class SQLiteEventRepository(_SQLiteRepositoryBase, EventRepository):
             row = conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()
         return int(row["c"])
 
+    def list_since(self, since: datetime) -> list[Event]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM events WHERE detected_at >= ? ORDER BY detected_at, id",
+                (_to_iso(since),),
+            ).fetchall()
+        return [_to_event(row) for row in rows]
+
     def list_title_keys_since(self, since: datetime) -> list[str]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -251,6 +259,14 @@ class SQLiteNotificationRepository(_SQLiteRepositoryBase, NotificationRepository
                 ),
             ).fetchall()
         return [_to_notification_state(row) for row in rows]
+
+    def list_hashes_created_since(self, since: datetime) -> set[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT content_hash FROM notifications WHERE created_at >= ?",
+                (_to_iso(since),),
+            ).fetchall()
+        return {row["content_hash"] for row in rows}
 
     def count_exhausted(self, max_retry_count: int) -> int:
         with self._connect() as conn:

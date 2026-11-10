@@ -49,6 +49,10 @@ class EventRepository(ABC):
         """保存件数。"""
 
     @abstractmethod
+    def list_since(self, since: datetime) -> list[Event]:
+        """検出日時が since 以降のイベント。"""
+
+    @abstractmethod
     def list_title_keys_since(self, since: datetime) -> list[str]:
         """検出日時が since 以降のイベントの title_key（空文字は除く）。
 
@@ -86,6 +90,10 @@ class NotificationRepository(ABC):
     @abstractmethod
     def list_dispatchable(self, max_retry_count: int, limit: int) -> list[NotificationState]:
         """通知すべき状態（pending と、上限未満の failed）を古い順に返す。"""
+
+    @abstractmethod
+    def list_hashes_created_since(self, since: datetime) -> set[str]:
+        """since 以降に通知対象として登録された（＝通知した / しようとした）content_hash。"""
 
     @abstractmethod
     def count_exhausted(self, max_retry_count: int) -> int:
