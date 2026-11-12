@@ -29,6 +29,14 @@ _MAX_SUFFIX_STRIPS = 2
 # Google ニュース経由の見出し末尾「 - 媒体名」（媒体名の取り出し用）
 _OUTLET_PATTERN = re.compile(r"\s-\s([^-]{2,30})$")
 
+# 記事に付属する画像ページの見出し。元の記事の写真を 1 枚ずつ見せるページで、
+# 中身は元記事と同じ。媒体や Google ニュースが新しい日付で出し直すことがあり、
+# 古いコラボの話題が「新着」として紛れ込む原因になる。
+#   「＜画像1 / 6＞人気アニメ…」「画像2 / 11＞…」（ウォーカープラス）
+#   「…のグッズ [画像ギャラリー 16/18]」（ナタリー）
+#   「…が登場 1枚目の写真・画像」（アニメ！アニメ！）
+_GALLERY_PAGE_PATTERN = re.compile(r"画像\s*\d+\s*/\s*\d+|画像ギャラリー|\d+\s*枚目の写真・画像")
+
 
 def strip_source_suffixes(title: str) -> str:
     """見出しから配信元の付け足しを剥がし、全角・半角を揃えた本文部分を返す。
@@ -56,6 +64,11 @@ def outlet_name(title: str, source: str) -> str:
     """
     match = _OUTLET_PATTERN.search(title.strip())
     return normalize_name(match.group(1) if match else source)
+
+
+def is_gallery_page(title: str) -> bool:
+    """記事に付属する画像ページ（元記事の写真ページ）の見出しかどうか。"""
+    return bool(_GALLERY_PAGE_PATTERN.search(unicodedata.normalize("NFKC", title)))
 
 
 def normalize_name(name: str) -> str:

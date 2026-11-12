@@ -61,6 +61,8 @@ class Settings:
     # 公開からこの日数を過ぎた記事は、保存（＝以後の重複判定）だけして通知しない。
     # 0 以下なら日数で絞らない。
     max_article_age_days: float = DEFAULT_MAX_ARTICLE_AGE_DAYS
+    # DB が空のとき（新しい話題の初回・キャッシュ消失後）は記録だけして通知しない
+    seed_on_first_run: bool = True
     db_path: str = DEFAULT_DB_PATH
     # 通知先 Discord Webhook URL を読む環境変数名。URL そのものは設定ファイルに書かない
     webhook_env: str = DEFAULT_WEBHOOK_ENV
@@ -200,6 +202,13 @@ def _parse_event_grouping(raw: Any) -> EventGroupingConfig:
     )
 
 
+def _parse_bool(value: Any) -> bool:
+    """YAML の真偽値。文字列の "false" などを True と誤読しないよう厳密に扱う。"""
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"真偽値（true / false）である必要があります: {value!r}")
+
+
 def _parse_settings(raw_settings: Any) -> Settings:
     if raw_settings is None:
         return Settings()
@@ -218,6 +227,7 @@ def _parse_settings(raw_settings: Any) -> Settings:
             max_article_age_days=float(
                 raw_settings.get("max_article_age_days", DEFAULT_MAX_ARTICLE_AGE_DAYS)
             ),
+            seed_on_first_run=_parse_bool(raw_settings.get("seed_on_first_run", True)),
             db_path=str(raw_settings.get("db_path", DEFAULT_DB_PATH)),
             webhook_env=str(raw_settings.get("webhook_env", DEFAULT_WEBHOOK_ENV)),
         )

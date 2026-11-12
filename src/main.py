@@ -35,6 +35,7 @@ from src.notifiers.discord import DiscordNotifier, DiscordNotifierError
 from src.repositories.base import EventRepository, NotificationRepository
 from src.repositories.sqlite import SQLiteEventRepository, SQLiteNotificationRepository
 from src.source_priority import SourcePriority
+from src.titles import is_gallery_page
 
 logger = logging.getLogger(__name__)
 
@@ -65,14 +66,19 @@ class RunSummary:
     too_old: int = 0
     # 同じ出来事（同じコラボ）を最近通知済みだったため、保存だけして通知しなかった件数
     same_event: int = 0
+    # 元記事の写真ページ（古い記事の出し直し）だったため、保存だけして通知しなかった件数
+    gallery_pages: int = 0
+    # 初回実行（DB が空）のため、保存だけして通知しなかった件数
+    seeded: int = 0
 
     def as_log_message(self) -> str:
         return (
             f"実行結果: 取得={self.collected} 一致={self.matched} "
             f"新規保存={self.saved} 通知成功={self.notified} "
             f"通知失敗={self.notify_failed} うち再送={self.retried} "
-            f"類似タイトル除外={self.near_duplicates} 古い記事で通知せず={self.too_old} "
-            f"同じ出来事で通知せず={self.same_event}"
+            f"類似タイトル除外={self.near_duplicates} 画像ページで通知せず={self.gallery_pages} "
+            f"古い記事で通知せず={self.too_old} 同じ出来事で通知せず={self.same_event} "
+            f"初回のため記録のみ={self.seeded}"
         )
 
 
@@ -128,6 +134,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
         event_grouper=build_event_grouper(config),
         event_window_days=config.event_grouping.window_days,
+        seed_when_empty=config.settings.seed_on_first_run,
     )
     logger.info(summary.as_log_message())
     return EXIT_OK
@@ -178,6 +185,7 @@ def run(
     source_priority: Optional[SourcePriority] = None,
     event_grouper: Optional[EventGrouper] = None,
     event_window_days: float = 0,
+    seed_when_empty: bool = False,
 ) -> RunSummary:
     """収集から通知までの 1 サイクル。
 
@@ -185,6 +193,12 @@ def run(
     """
     summary = RunSummary()
     detected_at = datetime.now(timezone.utc)
+    # DB が空のとき（新しい話題の初回・キャッシュ消失後）は記録だけして通知しない。
+    # 過去に見た記事が分からないので、Google ニュースが新しい日付で出し直した
+    # 古い記事まで「新着」に見えてしまうため
+    seeding = seed_when_empty and _is_empty_safely(repository)
+    if seeding:
+        logger.warning("保存済みの記事が無いため、今回は記録だけ行い通知しません（初回実行）")
     title_index = _TitleIndex(_load_recent_title_keys(repository, detected_at))
     gate = _NotificationGate.build(
         repository,
@@ -227,12 +241,13 @@ def run(
             logger.debug("似たタイトルの記事が保存済みのため通知しません: %s", event.title)
             continue
         reason = gate.reason_to_skip(event)
-        if reason is _SkipReason.TOO_OLD:
-            summary.too_old += 1
+        if reason is not None:
+            setattr(summary, reason.value, getattr(summary, reason.value) + 1)
+            logger.debug("通知しません（%s）: %s", reason.value, event.title)
             continue
-        if reason is _SkipReason.SAME_EVENT:
-            summary.same_event += 1
-            logger.debug("同じ出来事を通知済みのため通知しません: %s", event.title)
+
+        if seeding:
+            summary.seeded += 1
             continue
 
         gate.remember(event)
@@ -420,8 +435,9 @@ def _best_versions_first(events: Sequence[Event], priority: SourcePriority) -> l
 
 
 class _SkipReason(Enum):
-    """新しく保存した記事を通知しない理由。"""
+    """新しく保存した記事を通知しない理由。値は RunSummary の集計項目名。"""
 
+    GALLERY_PAGE = "gallery_pages"
     TOO_OLD = "too_old"
     SAME_EVENT = "same_event"
 
@@ -487,6 +503,10 @@ class _NotificationGate:
 
     def reason_to_skip(self, event: Event) -> Optional[_SkipReason]:
         """通知しない理由。通知してよければ None。"""
+        if is_gallery_page(event.title):
+            # 元記事の写真ページ。古い記事が新しい日付で出し直されることがあるので、
+            # 公開日時に関係なく通知しない
+            return _SkipReason.GALLERY_PAGE
         if self.cutoff is not None and event.published_at is not None:
             if _as_utc(event.published_at) < self.cutoff:
                 return _SkipReason.TOO_OLD
@@ -539,6 +559,15 @@ def _load_recent_title_keys(repository: EventRepository, now: datetime) -> list[
 def _as_utc(value: datetime) -> datetime:
     """tz なしの日時は UTC とみなす（Collector によっては tz なしで来ることがある）。"""
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _is_empty_safely(repository: EventRepository) -> bool:
+    """保存済みの記事が 1 件も無いか。確認に失敗したら空ではないとみなす（通知を止めない）。"""
+    try:
+        return repository.count() == 0
+    except Exception:
+        logger.exception("保存件数の取得に失敗しました")
+        return False
 
 
 def _is_saved_safely(repository: EventRepository, event: Event) -> bool:

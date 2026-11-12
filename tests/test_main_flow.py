@@ -889,3 +889,68 @@ def test_grouping_is_disabled_when_window_is_zero(
 
     assert summary.same_event == 0
     assert len(notifier.batches[0]) == 2
+
+
+def test_gallery_page_is_saved_but_not_notified_even_if_fresh(
+    repo: SQLiteEventRepository,
+    notif_repo: SQLiteNotificationRepository,
+    keyword_filter: KeywordFilter,
+) -> None:
+    """元記事の写真ページは、新しい日付で出し直されても通知しない（中身は古い記事）。"""
+    now = datetime.now(timezone.utc)
+    gallery = _article(
+        "＜画像1 / 6＞人気アニメ「ポケモン」イベントに楽しいコラボメニュー登場 - ウォーカープラス",
+        "https://example.com/gallery",
+        now,
+    )
+    regular = _article("ポケモンのコラボカフェが本日オープンしました", "https://example.com/regular", now)
+    notifier = FakeBatchNotifier(succeed=True)
+
+    summary = run(
+        collectors=[FakeCollector("フィード1", articles=[gallery, regular])],
+        relevance_filter=keyword_filter,
+        repository=repo,
+        notification_repository=notif_repo,
+        notifier=notifier,
+        max_notifications=20,
+    )
+
+    assert summary.saved == 2
+    assert summary.gallery_pages == 1
+    assert [e.url for e in notifier.batches[0]] == ["https://example.com/regular"]
+
+
+def test_first_run_on_empty_db_only_records_when_seeding(
+    repo: SQLiteEventRepository,
+    notif_repo: SQLiteNotificationRepository,
+    keyword_filter: KeywordFilter,
+) -> None:
+    """DB が空の初回は記録だけ行い、2 回目以降の新着から通知する。
+
+    Google ニュースは古い記事を新しい日付で出し直すことがあり、過去に見た記事が
+    分からない初回は、それが「新着」に見えてしまうため。
+    """
+    now = datetime.now(timezone.utc)
+    redated_old = _article("ポケモンとファミマのキャンペーンが開催されます", "https://example.com/old", now)
+    really_new = _article("ポケモンのコラボカフェが本日オープンしました", "https://example.com/new", now)
+
+    def run_with(articles, notifier):
+        return run(
+            collectors=[FakeCollector("フィード1", articles=articles)],
+            relevance_filter=keyword_filter,
+            repository=repo,
+            notification_repository=notif_repo,
+            notifier=notifier,
+            max_notifications=20,
+            seed_when_empty=True,
+        )
+
+    first_notifier = FakeBatchNotifier(succeed=True)
+    first = run_with([redated_old], first_notifier)
+    second_notifier = FakeBatchNotifier(succeed=True)
+    second = run_with([redated_old, really_new], second_notifier)
+
+    assert first.seeded == 1
+    assert first_notifier.batches == []
+    assert second.seeded == 0
+    assert [e.url for e in second_notifier.batches[0]] == ["https://example.com/new"]
