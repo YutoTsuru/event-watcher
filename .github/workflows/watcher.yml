@@ -1,13 +1,19 @@
 name: event-watcher
 
 on:
+  # 予備の定期実行。本番は cron-job.org からの workflow_dispatch（JST 9:00 / 21:00 ちょうど）。
+  # GitHub の定期実行は数時間遅れるので、本番が動いている間は guard ジョブで何もせず終わる
+  # （遅れて動いた予備が新着を中途半端な時刻に通知してしまうため）。
   schedule:
-    # 1日2回（UTC 0:00 / 12:00 = JST 9:00 / 21:00）
     - cron: "0 0,12 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
         description: "Discord へ通知せず収集・保存のみ行う"
+        type: boolean
+        default: false
+      as_backup:
+        description: "予備の定期実行と同じ判定を試す（本番が直近で成功していれば何もしない）"
         type: boolean
         default: false
 
@@ -17,7 +23,43 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # 予備の定期実行（schedule）のときだけ、本番が直近で動いているかを確かめる。
+  # 本番（workflow_dispatch）が 13 時間以内に成功していれば、watch ジョブを動かさない。
+  # 成功していなければ cron-job.org が止まっている（トークン期限切れなど）とみなし、
+  # 遅れてでも通知するとともに警告を出す。
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Check recent cron-job.org trigger
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          AS_BACKUP: ${{ inputs.as_backup && 'true' || 'false' }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$EVENT_NAME" != "schedule" ] && [ "$AS_BACKUP" != "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          last=$(gh api "repos/$REPO/actions/workflows/watcher.yml/runs?event=workflow_dispatch&status=success&per_page=1" \
+            --jq '.workflow_runs[0].created_at // empty')
+          if [ -n "$last" ] && [ $(( $(date +%s) - $(date -d "$last" +%s) )) -lt $(( 13 * 3600 )) ]; then
+            echo "本番の起動（$last UTC）が成功しているため、予備の定期実行は何もしません"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::cron-job.org からの起動が 13 時間以上成功していません（最後: ${last:-なし}）。トークンの期限切れや cron-job.org のジョブを確認してください。予備として実行します"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
   watch:
+    needs: guard
+    if: ${{ needs.guard.outputs.run == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -59,7 +101,8 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          python -m src.main --config config/targets.yaml --log-level INFO             ${{ inputs.dry_run && '--dry-run' || '' }}
+          python -m src.main --config config/targets.yaml --log-level INFO \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
 
       # --- ハイキューのコラボ情報（config/haikyu.yaml）---
       # ポケモン側が失敗しても実行する。Secret が未登録の間はスキップする。
@@ -73,7 +116,8 @@ jobs:
             echo "::warning::DISCORD_WEBHOOK_URL_HAIKYU が未登録のため、ハイキューの監視をスキップします"
             exit 0
           fi
-          python -m src.main --config config/haikyu.yaml --log-level INFO             ${{ inputs.dry_run && '--dry-run' || '' }}
+          python -m src.main --config config/haikyu.yaml --log-level INFO \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: Save Pokemon database
         if: always()
